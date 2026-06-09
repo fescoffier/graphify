@@ -4041,6 +4041,326 @@ def extract_csharp(path: Path) -> dict:
     return _extract_generic(path, _CSHARP_CONFIG)
 
 
+def _extract_vb_regex(path: Path) -> dict:
+    """Dependency-free, case-insensitive line scanner for VB.NET (.vb) source.
+
+    Used as the fallback when the tree-sitter VB grammar is unavailable, and as
+    the primary path in practice since the grammar is not on PyPI."""
+    str_path = str(path)
+    stem = _file_stem(path)
+    file_nid = _make_id(str_path)
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def add_node(nid: str, label: str, line: int,
+                 source_file: str = str_path, source_location: str | None = None) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid,
+                "label": label,
+                "file_type": "code",
+                "source_file": source_file,
+                "source_location": source_location if source_location is not None else f"L{line}",
+            })
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 context: str | None = None) -> None:
+        edge = {
+            "source": src,
+            "target": tgt,
+            "relation": relation,
+            "confidence": "EXTRACTED",
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        }
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    add_node(file_nid, path.name, 1)
+
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"nodes": nodes, "edges": edges}
+
+    # Stack of frames; each frame = dict(kind, nid, is_type).
+    frames: list[dict] = []
+
+    def enclosing_type() -> str | None:
+        for frame in reversed(frames):
+            if frame["is_type"]:
+                return frame["nid"]
+        return None
+
+    def enclosing_container() -> str:
+        for frame in reversed(frames):
+            if frame["is_type"] or frame["kind"] == "namespace":
+                return frame["nid"]
+        return file_nid
+
+    _re_imports = re.compile(r"(?i)^Imports\s+([A-Za-z_][\w.]*)")
+    _re_namespace = re.compile(r"(?i)^Namespace\s+([A-Za-z_][\w.]*)")
+    _re_type = re.compile(
+        r"(?i)^(?:(?:Public|Private|Protected|Friend|Partial|MustInherit|"
+        r"NotInheritable|Shared|Shadows|Overloads|Default|Global)\s+)*"
+        r"(Class|Module|Interface|Structure|Enum)\s+([A-Za-z_]\w*)"
+    )
+    _re_inherits = re.compile(r"(?i)^Inherits\s+([A-Za-z_][\w.]*)")
+    _re_implements = re.compile(r"(?i)^Implements\s+(.+)")
+    _re_member = re.compile(
+        r"(?i)^(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|"
+        r"MustOverride|NotOverridable|Shadows|Overloads|Partial|Default|ReadOnly|"
+        r"WriteOnly|Async|Iterator|Protected Friend|Friend Protected)\s+)*"
+        r"(Sub|Function|Property|Event)\s+([A-Za-z_]\w*)"
+    )
+    _re_end = re.compile(r"(?i)^End\s+(Class|Module|Interface|Structure|Enum|Namespace)")
+
+    for lineno, raw_line in enumerate(source.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Imports
+        m = _re_imports.match(line)
+        if m:
+            name = m.group(1)
+            last = name.split(".")[-1]
+            tgt = _make_id(last)
+            if tgt not in seen_ids:
+                add_node(tgt, last, lineno, source_file="", source_location="")
+            add_edge(file_nid, tgt, "imports", lineno, context="import")
+            continue
+
+        # Namespace
+        m = _re_namespace.match(line)
+        if m:
+            name = m.group(1)
+            ns_nid = _make_id(stem, name)
+            add_node(ns_nid, name, lineno)
+            add_edge(enclosing_container(), ns_nid, "contains", lineno)
+            frames.append({"kind": "namespace", "nid": ns_nid, "is_type": False})
+            continue
+
+        # Type declaration
+        m = _re_type.match(line)
+        if m:
+            keyword, name = m.group(1), m.group(2)
+            type_nid = _make_id(stem, name)
+            add_node(type_nid, name, lineno)
+            add_edge(enclosing_container(), type_nid, "contains", lineno)
+            frames.append({"kind": keyword.lower(), "nid": type_nid, "is_type": True})
+            continue
+
+        # Inherits (only inside a type)
+        m = _re_inherits.match(line)
+        if m and enclosing_type():
+            base = m.group(1).split(".")[-1]
+            base_nid = _make_id(base)
+            if base_nid not in seen_ids:
+                add_node(base_nid, base, lineno, source_file="", source_location="")
+            add_edge(enclosing_type(), base_nid, "inherits", lineno)
+            continue
+
+        # Implements (class-level: line STARTS with Implements)
+        m = _re_implements.match(line)
+        if m and enclosing_type():
+            for item in m.group(1).split(","):
+                item = item.strip().split(".")[-1]
+                if not item:
+                    continue
+                base_nid = _make_id(item)
+                if base_nid not in seen_ids:
+                    add_node(base_nid, item, lineno, source_file="", source_location="")
+                add_edge(enclosing_type(), base_nid, "implements", lineno)
+            continue
+
+        # Member (only inside a type)
+        m = _re_member.match(line)
+        if m and enclosing_type():
+            name = m.group(2)
+            member_nid = _make_id(enclosing_type(), name)
+            add_node(member_nid, name, lineno)
+            add_edge(enclosing_type(), member_nid, "contains", lineno)
+            continue
+
+        # End of a block
+        m = _re_end.match(line)
+        if m:
+            kind = m.group(1).lower()
+            if frames and frames[-1]["kind"] == kind:
+                frames.pop()
+            continue
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def _extract_vb_treesitter(path: Path) -> dict:
+    """Self-contained tree-sitter walker for VB.NET. Returns an error dict (never
+    raises) so the hybrid extractor can fall back to the regex scanner cleanly.
+
+    The grammar (tree-sitter-vb-dotnet) is not on PyPI, so this path is rarely
+    exercised; it is written defensively with a clean fallback over completeness."""
+    try:
+        try:
+            import tree_sitter_tree_sitter_vb_dotnet as _vbmod
+        except ImportError:
+            return {"nodes": [], "edges": [],
+                    "error": "tree_sitter_tree_sitter_vb_dotnet not installed"}
+
+        from tree_sitter import Language, Parser
+        lang = Language(_vbmod.language())
+        parser = Parser(lang)
+        source = path.read_bytes()
+        root = parser.parse(source).root_node
+
+        str_path = str(path)
+        stem = _file_stem(path)
+        file_nid = _make_id(str_path)
+
+        nodes: list[dict] = []
+        edges: list[dict] = []
+        seen_ids: set[str] = set()
+
+        def add_node(nid: str, label: str, line: int) -> None:
+            if nid not in seen_ids:
+                seen_ids.add(nid)
+                nodes.append({
+                    "id": nid,
+                    "label": label,
+                    "file_type": "code",
+                    "source_file": str_path,
+                    "source_location": f"L{line}",
+                })
+
+        def add_edge(src: str, tgt: str, relation: str, line: int,
+                     confidence: str = "EXTRACTED", context: str | None = None) -> None:
+            edge = {
+                "source": src,
+                "target": tgt,
+                "relation": relation,
+                "confidence": confidence,
+                "source_file": str_path,
+                "source_location": f"L{line}",
+                "weight": 1.0,
+            }
+            if context:
+                edge["context"] = context
+            edges.append(edge)
+
+        add_node(file_nid, path.name, 1)
+
+        _TYPE_TYPES = frozenset({
+            "class_block", "module_block", "interface_block",
+            "structure_block", "enum_block",
+        })
+        _MEMBER_TYPES = frozenset({
+            "method_declaration", "constructor_declaration",
+            "property_declaration", "event_declaration",
+        })
+
+        def decl_name(node) -> str | None:
+            name_node = node.child_by_field_name("name")
+            if name_node is not None:
+                return _read_text(name_node, source)
+            # Fallback: scan the node and its header child(ren) for the first
+            # identifier-like named child.
+            candidates = [node]
+            for child in node.named_children:
+                if child.type.endswith("statement") or child.type.endswith("header"):
+                    candidates.append(child)
+            for cand in candidates:
+                for child in cand.named_children:
+                    if "identifier" in child.type or child.type == "name":
+                        return _read_text(child, source)
+            return None
+
+        def walk(node, parent_ns: str | None, parent_type: str | None) -> None:
+            ntype = node.type
+            line = node.start_point[0] + 1
+            container = parent_type or parent_ns or file_nid
+
+            if ntype == "namespace_block":
+                name = decl_name(node)
+                if name:
+                    ns_nid = _make_id(stem, name)
+                    add_node(ns_nid, name, line)
+                    add_edge(container, ns_nid, "contains", line)
+                    for child in node.children:
+                        walk(child, ns_nid, parent_type)
+                    return
+
+            elif ntype in _TYPE_TYPES:
+                name = decl_name(node)
+                if name:
+                    type_nid = _make_id(stem, name)
+                    add_node(type_nid, name, line)
+                    add_edge(container, type_nid, "contains", line)
+                    for child in node.children:
+                        walk(child, parent_ns, type_nid)
+                    return
+
+            elif ntype in _MEMBER_TYPES and parent_type:
+                name = decl_name(node)
+                if name:
+                    member_nid = _make_id(parent_type, name)
+                    add_node(member_nid, name, line)
+                    add_edge(parent_type, member_nid, "contains", line)
+
+            elif ntype == "imports_statement":
+                raw = _read_text(node, source)
+                tokens = re.findall(r"[A-Za-z_][\w.]*", raw)
+                # First token is the "Imports" keyword; the rest hold the name.
+                for tok in tokens[1:]:
+                    last = tok.split(".")[-1]
+                    if last and last.lower() != "imports":
+                        tgt = _make_id(last)
+                        add_edge(file_nid, tgt, "imports", line, context="import")
+                        break
+
+            elif ntype == "inherits_clause" and parent_type:
+                for child in node.named_children:
+                    base = _read_text(child, source).split(".")[-1].strip()
+                    if base:
+                        add_edge(parent_type, _make_id(base), "inherits", line)
+
+            elif ntype == "implements_clause" and parent_type:
+                for child in node.named_children:
+                    base = _read_text(child, source).split(".")[-1].strip()
+                    if base:
+                        add_edge(parent_type, _make_id(base), "implements", line)
+
+            elif ntype in ("invocation_expression", "invocation"):
+                target = node.child_by_field_name("target")
+                if target is not None:
+                    callee = _read_text(target, source).split(".")[-1].strip()
+                    if callee:
+                        src_nid = parent_type or parent_ns or file_nid
+                        add_edge(src_nid, _make_id(callee), "calls", line,
+                                 confidence="INFERRED")
+
+            for child in node.children:
+                walk(child, parent_ns, parent_type)
+
+        walk(root, None, None)
+        return {"nodes": nodes, "edges": edges}
+    except Exception as e:  # noqa: BLE001 - must never crash the pipeline
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+
+def extract_vb(path: Path) -> dict:
+    """Extract VB.NET constructs, preferring tree-sitter and falling back to the
+    dependency-free regex scanner when the grammar is unavailable."""
+    result = _extract_vb_treesitter(path)
+    if "error" in result or len(result.get("nodes", [])) <= 1:
+        return _extract_vb_regex(path)
+    return result
+
+
 def extract_apex(path: Path) -> dict:
     """Extract classes, interfaces, enums, methods, and Salesforce constructs from
     Apex .cls and .trigger files using regex (no tree-sitter grammar on PyPI)."""
@@ -11113,6 +11433,7 @@ _DISPATCH: dict[str, Any] = {
     ".slnx": extract_slnx,
     ".csproj": extract_csproj,
     ".fsproj": extract_csproj,
+    ".vb": extract_vb,
     ".vbproj": extract_csproj,
     ".razor": extract_razor,
     ".cshtml": extract_razor,

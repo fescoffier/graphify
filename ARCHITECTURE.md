@@ -63,6 +63,8 @@ Every extractor returns:
 4. Add the tree-sitter package to `pyproject.toml` dependencies.
 5. Add a fixture file to `tests/fixtures/` and tests to `tests/test_languages.py`.
 
+> Note: `.vb` (VB.NET) uses a hybrid extractor that prefers tree-sitter and falls back to a dependency-free regex scanner; its grammar (`tree-sitter-vb-dotnet`) is optional and git-installed via the `[vb]` extra rather than a PyPI dependency.
+
 ## Security
 
 All external input passes through `graphify/security.py` before use:

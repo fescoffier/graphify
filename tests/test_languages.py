@@ -9,6 +9,7 @@ from graphify.extract import (
     extract_groovy, extract_sln, extract_csproj, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex,
+    extract_vb, _extract_vb_regex,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -297,6 +298,39 @@ def test_csharp_parameter_return_and_generic_contexts():
     assert ("Build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
     assert ("Build", "Result") in _edge_labels(result, "references", "return_type")
     assert ("Build", "DataProcessor") in _edge_labels(result, "references", "generic_arg")
+
+
+# ── VB.NET ────────────────────────────────────────────────────────────────────
+
+def test_vb_no_error():
+    # Hybrid extractor: tree-sitter VB grammar is not on PyPI, so this falls back
+    # to the regex scanner. Smoke test only.
+    assert "error" not in extract_vb(FIXTURES / "sample.vb")
+
+def test_vb_finds_types():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    labels = _labels(r)
+    for name in ("Demo.App", "IWorker", "BaseWorker", "Worker", "Bootstrap"):
+        assert name in labels, f"missing type {name!r}"
+
+def test_vb_finds_members():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    labels = _labels(r)
+    for name in ("Run", "Log", "Name", "Completed", "Main"):
+        assert name in labels, f"missing member {name!r}"
+
+def test_vb_inherits_and_implements():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    assert ("Worker", "BaseWorker") in _edge_labels(r, "inherits")
+    assert ("Worker", "IWorker") in _edge_labels(r, "implements")
+
+def test_vb_imports():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    imports = _edge_labels(r, "imports")
+    targets = {tgt for _src, tgt in imports}
+    # Imports System  +  Imports System.Collections.Generic (last segment).
+    assert "System" in targets
+    assert "Generic" in targets
 
 
 def test_java_normalizes_inherits_and_implements():
