@@ -317,3 +317,100 @@ def test_fuzzy_merge_does_not_vacuum_same_label_nodes_from_other_files():
     assert "p3_donneeslots" in surviving_ids, (
         "same-label node from a third file was vacuumed into a fuzzy pair's merge"
     )
+
+
+# ── scope-guard refinements (doc exemption, language families, generic dirs) ──
+
+def test_doc_concept_still_merges_into_code_symbol():
+    """The scope guard must NOT block doc<->code unification: a concept node from
+    docs/arch.md merging into its code symbol is deliberately-engineered behavior
+    (it is why _make_minhash strips spaces). Non-code files carry no scope."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor",
+         "source_file": "src/extract.py"},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "docs/arch.md"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1, "doc concept must still merge into code symbol"
+
+
+def test_same_language_family_extensions_do_not_block():
+    """ts/tsx (and py/pyi, c/h, ...) are one language family — the guard must not
+    treat them as different languages."""
+    nodes = [
+        {"id": "usercard", "label": "UserCardWidget",
+         "source_file": "frontend/components/UserCard.tsx"},
+        {"id": "user_card", "label": "User Card Widget",
+         "source_file": "frontend/components/index.ts"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1, "ts/tsx must be one language family"
+
+
+def test_generic_top_dirs_are_not_app_boundaries():
+    """src/ vs lib/ in an ordinary single-app repo are layout convention, not
+    application boundaries — the app axis must not block across them."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor",
+         "source_file": "src/extract.py"},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "lib/extract_helpers.py"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1, "src/ vs lib/ must not be app boundaries"
+
+
+def test_merge_scope_contract():
+    """Pin _merge_scope's documented None-component cases."""
+    from graphify.dedup import _merge_scope
+
+    def scope(sf):
+        return _merge_scope({"source_file": sf})
+
+    assert scope("") == (None, None)                      # no source_file
+    assert scope("docs/arch.md") == (None, None)          # doc file: no scope at all
+    assert scope("C:/x/AppA/a.py") == (None, "py")        # absolute: no app
+    assert scope("/x/AppA/a.py") == (None, "py")          # absolute posix: no app
+    assert scope("a.py") == (None, "py")                  # bare filename: no app
+    assert scope("src/a.py") == (None, "py")              # generic top dir: no app
+    assert scope("AppA/sub/a.py") == ("appa", "py")       # real app dir
+    assert scope("AppA/Page.aspx.vb")[1] == "dotnet-vb"   # family, not raw ext
+    assert scope("AppA/x.ts")[1] == scope("AppB/y.tsx")[1]  # same family
+
+
+def test_llm_tiebreak_respects_cross_scope_gate(monkeypatch):
+    """Pass 3 (LLM tiebreaker) must apply the same app/language gate as Pass 2:
+    even an LLM 'yes, same concept' must not merge across app boundaries."""
+    import graphify.dedup as D
+    import graphify.llm as L
+
+    monkeypatch.setattr(L, "_get_backend_api_key", lambda backend: "fake-key")
+    monkeypatch.setattr(L, "_call_llm",
+                        lambda prompt, backend, max_tokens=200: "1. yes")
+
+    # JW similarity of the norms is ~88.5 (the ambiguous [75, 92) zone Pass 3 arbitrates).
+    cross_app = [
+        {"id": "a_proc", "label": "UpdateListQuart",
+         "source_file": "AppA/Pages/PageA.aspx.vb"},
+        {"id": "b_proc", "label": "UpdateGridNoQuart",
+         "source_file": "AppB/Pages/PageB.aspx.vb"},
+    ]
+    uf = D._UF()
+    D._llm_tiebreak(cross_app, uf, {}, backend="gemini")
+    assert uf.find("a_proc") != uf.find("b_proc"), (
+        "LLM tiebreak merged across an app boundary"
+    )
+
+    # Control: the same pair within one app DOES merge under the same mock.
+    same_app = [
+        {"id": "a_proc", "label": "UpdateListQuart",
+         "source_file": "AppA/Pages/PageA.aspx.vb"},
+        {"id": "b_proc", "label": "UpdateGridNoQuart",
+         "source_file": "AppA/Pages/PageB.aspx.vb"},
+    ]
+    uf2 = D._UF()
+    D._llm_tiebreak(same_app, uf2, {}, backend="gemini")
+    assert uf2.find("a_proc") == uf2.find("b_proc"), (
+        "control pair should merge — the mock/JW-zone setup is broken"
+    )
