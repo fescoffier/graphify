@@ -9,6 +9,7 @@ from graphify.extract import (
     extract_groovy, extract_sln, extract_csproj, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
     extract_powershell, extract_apex,
+    extract_vb, _extract_vb_regex,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -297,6 +298,329 @@ def test_csharp_parameter_return_and_generic_contexts():
     assert ("Build", "HttpClient") in _edge_labels(result, "references", "parameter_type")
     assert ("Build", "Result") in _edge_labels(result, "references", "return_type")
     assert ("Build", "DataProcessor") in _edge_labels(result, "references", "generic_arg")
+
+
+# ── VB.NET ────────────────────────────────────────────────────────────────────
+
+def test_vb_no_error():
+    # Hybrid extractor: tree-sitter VB grammar is not on PyPI, so this falls back
+    # to the regex scanner. Smoke test only.
+    assert "error" not in extract_vb(FIXTURES / "sample.vb")
+
+def test_vb_finds_types():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    labels = _labels(r)
+    for name in ("Demo.App", "IWorker", "BaseWorker", "Worker", "Bootstrap"):
+        assert name in labels, f"missing type {name!r}"
+
+def test_vb_finds_members():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    labels = _labels(r)
+    for name in ("Run", "Log", "Name", "Completed", "Main"):
+        assert name in labels, f"missing member {name!r}"
+
+def test_vb_inherits_and_implements():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    assert ("Worker", "BaseWorker") in _edge_labels(r, "inherits")
+    assert ("Worker", "IWorker") in _edge_labels(r, "implements")
+
+def test_vb_imports():
+    r = _extract_vb_regex(FIXTURES / "sample.vb")
+    imports = _edge_labels(r, "imports")
+    targets = {tgt for _src, tgt in imports}
+    # Imports System  +  Imports System.Collections.Generic (last segment).
+    assert "System" in targets
+    assert "Generic" in targets
+
+
+# ── VB.NET tree-sitter walker ──────────────────────────────────────────────────
+# The tree-sitter-vb-dotnet grammar is an optional [vb] extra (not on PyPI), so
+# these tests skip when it is absent and the hybrid extractor falls back to regex.
+
+from graphify.extract import _extract_vb_treesitter  # noqa: E402
+
+_needs_vb = pytest.mark.skipif(
+    _ilu.find_spec("tree_sitter_tree_sitter_vb_dotnet") is None,
+    reason="tree-sitter-vb-dotnet not installed (optional [vb] extra)",
+)
+
+_VB_TS_FIXTURE = FIXTURES / "sample_vb_treesitter.vb"
+
+
+@_needs_vb
+def test_vb_ts_no_error():
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    assert "error" not in r
+    # The grammar must actually parse structure, not bail to the regex fallback.
+    assert len(r["nodes"]) > 1
+
+
+@_needs_vb
+def test_vb_ts_calls_attributed_to_enclosing_member():
+    # Defect #1: calls must originate from the calling *method*, not the class,
+    # and resolve to the same-file qualified node id (not a dangling bare id).
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    calls = _calls(r)
+    assert ("FCT_MALOInitial", "FCT_AdaptORMAL") in calls
+    assert ("FCT_MALOInitial", "FCT_RecupMalParDefaut") in calls
+    assert ("Compute", "FCT_MALOInitial") in calls
+    # Resolve to a sibling method in the same class: FCT_RecupMalParDefaut -> Base.
+    assert ("FCT_RecupMalParDefaut", "Base") in calls
+    # Every calls edge endpoint must be a real node (no dangling bare-name ids).
+    ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        if e["relation"] == "calls":
+            assert e["source"] in ids and e["target"] in ids
+
+
+@_needs_vb
+def test_vb_ts_inherits_and_implements_resolve_same_file():
+    # Defect #2: Inherits/Implements (which the grammar does NOT parse as clause
+    # nodes) must be recovered and resolved to same-file qualified type ids.
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    inherits = _edge_labels(r, "inherits")
+    assert ("EtapeElaboration", "Etape") in inherits
+    assert ("Soufflage", "EtapeElaboration") in inherits
+    assert ("EtapeElaboration", "IEtape") in _edge_labels(r, "implements")
+    # Same-file base targets must point at the real (sourced) type node.
+    src_by_id = {n["id"]: n["source_file"] for n in r["nodes"]}
+    label_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    for e in r["edges"]:
+        if e["relation"] == "inherits" and label_by_id.get(e["target"]) == "EtapeElaboration":
+            assert src_by_id.get(e["target"]), "same-file base resolved to a sourceless stub"
+
+
+@_needs_vb
+def test_vb_ts_new_instantiation_emits_reference():
+    # Defect #3: `New <SameFileType>` produces a references edge from the member.
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    refs = {(s, t) for s, t, _e in _references(r)}
+    assert ("FCT_MALOInitial", "Recherche") in refs
+
+
+@_needs_vb
+def test_vb_ts_cross_file_call_deferred_to_raw_calls():
+    # Member calls into other files are deferred for the cross-file resolver,
+    # never emitted as dangling same-file edges.
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    deferred = {rc["callee"] for rc in r.get("raw_calls", [])}
+    assert "DoExternalThing" in deferred
+    # Constructor invocations (MyBase.New) carry no call-graph signal.
+    assert not any(rc["callee"].casefold() == "new" for rc in r.get("raw_calls", []))
+
+
+@_needs_vb
+def test_vb_ts_structure_parity_with_regex():
+    # Structure must not regress versus the regex scanner: every type and member
+    # the regex finds should also be present in the tree-sitter output.
+    ts = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    rx = _extract_vb_regex(_VB_TS_FIXTURE)
+    ts_labels = set(_labels(ts))
+    for name in ("Etape", "EtapeElaboration", "Soufflage", "Recherche", "IEtape",
+                 "FCT_MALOInitial", "FCT_AdaptORMAL", "FCT_RecupMalParDefaut", "Base"):
+        assert name in ts_labels, f"tree-sitter missing {name!r}"
+    # Tree-sitter should be at least as complete as regex on types/members.
+    assert len(ts_labels) >= len(set(_labels(rx)))
+
+
+@_needs_vb
+def test_vb_ts_no_dangling_edge_endpoints_any_relation():
+    """Every edge endpoint must be a real node, for ALL relations — imports and
+    inherits targets included (stubs count: they are sourceless but real nodes)."""
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in ids, f"dangling source on {e['relation']}: {e['source']}"
+        assert e["target"] in ids, f"dangling target on {e['relation']}: {e['target']}"
+
+
+@_needs_vb
+def test_vb_nested_types_fall_back_to_regex(tmp_path):
+    """tree-sitter-vb-dotnet cannot parse nested types: the inner declaration
+    mangles into field_declaration/ERROR and every outer member after the inner
+    `End Class` vanishes into a top-level ERROR node. extract_vb must detect the
+    dropped type (textual count > tree count) and fall back to the regex scanner,
+    whose frame stack nests correctly."""
+    src = tmp_path / "nested.vb"
+    src.write_text(
+        "Public Class Container\n"
+        "    Public Class Helper\n"
+        "        Public Sub HelperWork()\n"
+        "        End Sub\n"
+        "    End Class\n"
+        "\n"
+        "    Public Sub ContainerMethod()\n"
+        "    End Sub\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    from graphify.extract import extract_vb
+    r = extract_vb(src)
+    labels = set(_labels(r))
+    # The tree-sitter walk loses Helper (as a type) and ContainerMethod entirely.
+    for name in ("Container", "Helper", "HelperWork", "ContainerMethod"):
+        assert name in labels, f"nested-type extraction lost {name!r}"
+    # Helper must be contained as a TYPE (under Container), and HelperWork under
+    # Helper — not attributed to Container.
+    contains = _edge_labels(r, "contains")
+    assert ("Helper", "HelperWork") in contains
+    assert ("Container", "ContainerMethod") in contains
+
+
+@_needs_vb
+def test_vb_ts_inherits_clause_edge_cases(tmp_path):
+    """Trailing comments, interface multi-base Inherits, generic Implements, and
+    the single-line colon form must all produce exactly the right base edges."""
+    src = tmp_path / "bases.vb"
+    src.write_text(
+        "Public Class WithComment\n"
+        "    Inherits Base ' legacy base, do not remove\n"
+        "End Class\n"
+        "\n"
+        "Public Interface IBoth\n"
+        "    Inherits IA, IB\n"
+        "End Interface\n"
+        "\n"
+        "Public Class GenericImpl\n"
+        "    Implements IDictionary(Of String, IList(Of Foo))\n"
+        "End Class\n"
+        "\n"
+        "Public Class ColonStyle : Inherits BaseThing\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_treesitter(src)
+    assert "error" not in r
+    inherits = _edge_labels(r, "inherits")
+    implements = _edge_labels(r, "implements")
+    assert ("WithComment", "Base") in inherits, "comment'd Inherits dropped"
+    assert ("IBoth", "IA") in inherits and ("IBoth", "IB") in inherits, \
+        "interface multi-base Inherits dropped"
+    assert ("ColonStyle", "BaseThing") in inherits, "colon-form Inherits dropped"
+    assert ("GenericImpl", "IDictionary") in implements
+    # The generic's type ARGUMENTS must not leak as implemented interfaces.
+    impl_targets = {t for _s, t in implements}
+    assert "IList" not in impl_targets and "Foo" not in impl_targets, \
+        "generic type arguments leaked as implements edges"
+
+
+@_needs_vb
+def test_vb_ts_framework_base_resolves_to_stub(tmp_path):
+    """A qualified framework base (`Inherits System.Web.UI.Page`) must clean to
+    its bare name and target a sourceless stub node, ready for corpus-wide
+    rewiring by _rewire_unique_stub_nodes."""
+    src = tmp_path / "page.vb"
+    src.write_text(
+        "Public Class MyPage\n"
+        "    Inherits System.Web.UI.Page\n"
+        "    Implements IDisposable\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_treesitter(src)
+    assert ("MyPage", "Page") in _edge_labels(r, "inherits")
+    assert ("MyPage", "IDisposable") in _edge_labels(r, "implements")
+    stub = next(n for n in r["nodes"] if n["label"] == "Page")
+    assert stub["source_file"] == "", "framework base must be a sourceless stub"
+
+
+@_needs_vb
+def test_vb_ts_alias_and_multiclause_imports(tmp_path):
+    """`Imports A, B` emits one edge per clause; `Imports F = X.Y.Z` targets the
+    real namespace (Z), never the file-local alias (F)."""
+    src = tmp_path / "imp.vb"
+    src.write_text(
+        "Imports System.IO, System.Text\n"
+        "Imports Frm = System.Windows.Forms\n"
+        "Public Class C\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_treesitter(src)
+    import_targets = {t for _s, t in _edge_labels(r, "imports")}
+    assert {"IO", "Text", "Forms"} <= import_targets
+    assert "Frm" not in {n["label"] for n in r["nodes"]}, \
+        "import alias must not become a node"
+
+
+def test_vb_regex_alias_and_multiclause_imports(tmp_path):
+    src = tmp_path / "imp.vb"
+    src.write_text(
+        "Imports System.IO, System.Text\n"
+        "Imports Frm = System.Windows.Forms\n"
+        "Public Class C\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_regex(src)
+    import_targets = {t for _s, t in _edge_labels(r, "imports")}
+    assert {"IO", "Text", "Forms"} <= import_targets
+    assert "Frm" not in {n["label"] for n in r["nodes"]}
+
+
+def test_vb_regex_handles_utf8_bom(tmp_path):
+    """Visual Studio writes a UTF-8 BOM by default. The regex scanner must not
+    lose the line-1 construct (here: the entire class) to a U+FEFF prefix."""
+    src = tmp_path / "bom.vb"
+    src.write_bytes(
+        b"\xef\xbb\xbfPublic Class BomClass\n"
+        b"    Inherits Base\n"
+        b"    Public Sub Work()\n"
+        b"    End Sub\n"
+        b"End Class\n"
+    )
+    r = _extract_vb_regex(src)
+    labels = set(_labels(r))
+    assert "BomClass" in labels and "Work" in labels
+    assert ("BomClass", "Base") in _edge_labels(r, "inherits")
+
+
+def test_vb_regex_colon_form_and_multibase(tmp_path):
+    src = tmp_path / "colon.vb"
+    src.write_text(
+        "Public Class ColonStyle : Inherits BaseThing\n"
+        "End Class\n"
+        "Public Interface IBoth\n"
+        "    Inherits IA, IB\n"
+        "End Interface\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_regex(src)
+    inherits = _edge_labels(r, "inherits")
+    assert ("ColonStyle", "BaseThing") in inherits
+    assert ("IBoth", "IA") in inherits and ("IBoth", "IB") in inherits
+
+
+@_needs_vb
+def test_vb_cross_file_new_resolves_as_references(tmp_path):
+    """End-to-end: a deferred `New X` raw_call must resolve cross-file with
+    relation='references'/context='type' (not 'calls') via extract()'s resolver."""
+    (tmp_path / "target.vb").write_text(
+        "Public Class UniqueVbTargetXyz\n"
+        "    Public Sub New(ByVal seed As Integer)\n"
+        "    End Sub\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "user.vb").write_text(
+        "Public Class Consumer\n"
+        "    Public Sub Use()\n"
+        "        Dim t As Object\n"
+        "        t = New UniqueVbTargetXyz(5)\n"
+        "    End Sub\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    from graphify.extract import extract
+    result = extract([tmp_path / "target.vb", tmp_path / "user.vb"],
+                     cache_root=tmp_path, parallel=False)
+    label_by_id = {n["id"]: n["label"] for n in result["nodes"]}
+    cross = [e for e in result["edges"]
+             if label_by_id.get(e["target"]) == "UniqueVbTargetXyz"
+             and label_by_id.get(e["source"]) == "Use"]
+    assert cross, "cross-file New did not resolve to an edge"
+    assert cross[0]["relation"] == "references"
+    assert cross[0].get("context") == "type"
 
 
 def test_java_normalizes_inherits_and_implements():

@@ -89,6 +89,87 @@ def _short_label_blocked(a: str, b: str, jw_score: float) -> bool:
     return True
 
 
+# Extensions that share a compilation/runtime boundary. Compared as families so
+# .ts/.tsx, .py/.pyi, .c/.h never read as "different languages" (build.py models
+# the same families for its cross-language INFERRED-calls filter). Unknown code
+# extensions map to themselves; that is intentionally stricter than None because
+# the guard exists precisely for unmodeled language pairs (vb-vs-cs style).
+_LANG_FAMILY: dict[str, str] = {
+    "py": "py", "pyi": "py",
+    "js": "js", "mjs": "js", "cjs": "js", "jsx": "js",
+    "ts": "js", "tsx": "js", "vue": "js", "svelte": "js", "astro": "js",
+    "java": "jvm", "kt": "jvm", "kts": "jvm", "scala": "jvm", "groovy": "jvm",
+    "c": "c", "h": "c", "cc": "c", "cpp": "c", "cxx": "c", "hpp": "c", "hh": "c", "hxx": "c",
+    "m": "c", "mm": "c",
+    "vb": "dotnet-vb", "vbproj": "dotnet-vb",
+    "cs": "dotnet-cs", "csproj": "dotnet-cs", "razor": "dotnet-cs", "cshtml": "dotnet-cs",
+    "f": "fortran", "f90": "fortran", "f95": "fortran", "f03": "fortran", "f08": "fortran",
+    "pas": "pascal", "pp": "pascal", "dpr": "pascal", "inc": "pascal",
+    "ex": "elixir", "exs": "elixir",
+    "sh": "shell", "bash": "shell",
+}
+
+# Conventional layout directories inside a single application. A top-level
+# segment from this set is NOT an application boundary — blocking src/ vs lib/
+# fuzzy merges would silently change behavior for every ordinary repo.
+_GENERIC_TOP_DIRS = frozenset({
+    "src", "lib", "libs", "app", "apps", "pkg", "pkgs", "packages", "cmd",
+    "internal", "include", "tests", "test", "testing", "spec", "docs", "doc",
+    "examples", "example", "samples", "scripts", "tools", "bin", "source",
+    "sources", "vendor", "third_party",
+})
+
+
+def _merge_scope(node: dict) -> tuple[str | None, str | None]:
+    """Return the (app, language-family) fuzzy-merge scope of a node's ``source_file``.
+
+    The guard only applies between CODE files: doc-derived semantic nodes (.md,
+    .pdf, ...) must keep merging into their code symbol ("Graph Extractor" from
+    docs/arch.md unifying with code node "GraphExtractor"), so non-code files get
+    no scope at all. ``app`` is the top-level path segment — in a multi-application
+    monorepo each app lives under its own top-level directory, and same-ish symbol
+    names across apps are naming convention, not identity; conventional single-app
+    layout dirs (src/, lib/, tests/, ...) are exempt. ``lang`` is the extension
+    mapped through _LANG_FAMILY. Either component is None when it cannot be
+    determined (no source_file, no directory part, absolute path for app); a None
+    component never blocks a merge.
+    """
+    sf = str(node.get("source_file") or "").replace("\\", "/")
+    if sf.startswith("./"):
+        sf = sf[2:]
+    if not sf:
+        return None, None
+    name = sf.rsplit("/", 1)[-1]
+    # name[1:] so dotfiles (".gitignore") don't read as an extension.
+    ext = name[1:].rsplit(".", 1)[-1].casefold() if "." in name[1:] else None
+    from graphify.detect import CODE_EXTENSIONS
+    if ext is None or f".{ext}" not in CODE_EXTENSIONS:
+        return None, None  # doc/image/unknown file — never scope-blocks
+    lang = _LANG_FAMILY.get(ext, ext)
+    app = None
+    # The top segment is only meaningful for relative paths (the pipeline
+    # relativizes source_file to the project root before dedup runs).
+    if "/" in sf and not sf.startswith("/") and not re.match(r"^[A-Za-z]:", sf):
+        top = sf.split("/", 1)[0].casefold()
+        if top not in _GENERIC_TOP_DIRS:
+            app = top
+    return app, lang
+
+
+def _cross_scope_blocked(a: dict, b: dict) -> bool:
+    """True when two nodes provably come from different applications (top-level
+    path segment) or different language families — such pairs are never
+    fuzzy-merge candidates (#defect: a VB symbol in one app merging with a
+    similarly-named C# symbol in another app rewires call edges across apps)."""
+    app_a, lang_a = _merge_scope(a)
+    app_b, lang_b = _merge_scope(b)
+    if app_a is not None and app_b is not None and app_a != app_b:
+        return True
+    if lang_a is not None and lang_b is not None and lang_a != lang_b:
+        return True
+    return False
+
+
 # ── union-find ────────────────────────────────────────────────────────────────
 
 class _UF:
@@ -213,6 +294,7 @@ def deduplicate_entities(
     if len(candidates) >= 2:
         lsh = MinHashLSH(threshold=_LSH_THRESHOLD, num_perm=_NUM_PERM)
         minhashes: dict[str, MinHash] = {}
+        candidate_by_id: dict[str, dict] = {n["id"]: n for n in candidates}
 
         for node in candidates:
             norm_label = _norm(node.get("label", node.get("id", "")))
@@ -234,7 +316,7 @@ def deduplicate_entities(
                 if uf.find(node_id) == uf.find(neighbor_id):
                     continue
 
-                neighbor = next((n for n in candidates if n["id"] == neighbor_id), None)
+                neighbor = candidate_by_id.get(neighbor_id)
                 if neighbor is None:
                     continue
 
@@ -251,6 +333,13 @@ def deduplicate_entities(
                 # regardless of JW score (#1201).
                 _lo, _hi = sorted((norm_label, neighbor_norm), key=len)
                 if _hi.startswith(_lo) and _hi != _lo:
+                    continue
+                # Different application (top-level path segment) or different
+                # language (extension) — never a true duplicate, regardless of
+                # JW score. Without this, a VB page handler fuzzy-merges with a
+                # similarly-named C# handler in a sibling app and every call
+                # edge to the loser gets rewired across the app boundary.
+                if _cross_scope_blocked(node, neighbor):
                     continue
 
                 c1 = communities.get(node_id)
@@ -269,9 +358,13 @@ def deduplicate_entities(
                         sf_b = neighbor.get("source_file") or ""
                         if sf_a != sf_b:
                             continue
-                    all_group = norm_to_nodes.get(norm_label, [node]) + \
-                                norm_to_nodes.get(neighbor_norm, [neighbor])
-                    winner = _pick_winner(all_group)
+                    # Union only the verified pair. Picking the winner from the
+                    # full norm-label groups (all nodes graph-wide sharing either
+                    # label) used to vacuum same-named symbols from *other* files
+                    # into this component — bypassing the #1046 cross-file guard
+                    # above and erasing per-file methods (a page lost ~9% of its
+                    # handlers to same-named siblings on a WebForms corpus).
+                    winner = _pick_winner([node, neighbor])
                     uf.union(winner["id"], node_id)
                     uf.union(winner["id"], neighbor_id)
                     fuzzy_merges += 1
@@ -381,6 +474,10 @@ def _llm_tiebreak(
                 continue
             _lo, _hi = sorted((norm_i, norm_j), key=len)
             if _hi.startswith(_lo) and _hi != _lo:
+                continue
+            # Same app/language gate as Pass 2 — an LLM "yes, same concept" must
+            # not merge symbols across application or language boundaries either.
+            if _cross_scope_blocked(node, neighbor):
                 continue
             c1 = communities.get(node["id"])
             c2 = communities.get(neighbor["id"])

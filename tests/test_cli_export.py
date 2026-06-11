@@ -421,3 +421,97 @@ def test_export_html_no_community_data_at_all_still_succeeds(tmp_path):
     # code stays clean — same behaviour as the pre-fallback empty-communities
     # path, just no longer silently failing on the common case.
     assert r.returncode == 0, r.stderr
+
+
+# ── cluster-only shrink-guard / --force (handoff defect #5) ──────────────────
+# cluster-only used to call to_json() without force and ignore both its return
+# value and GRAPHIFY_FORCE: a legitimate node-count reduction tripped the #479
+# shrink guard, the write was silently refused, and the CLI still printed
+# "graph.json updated".
+
+def _make_shrink_scenario(tmp_path: Path) -> tuple[Path, Path]:
+    """graphify-out/graph.json inflated with dummy nodes + a smaller external
+    graph for --graph, so cluster-only deterministically trips the shrink guard."""
+    out = _make_graph(tmp_path)
+    graph_json = out / "graph.json"
+    small_src = tmp_path / "small" / "graph.json"
+    small_src.parent.mkdir()
+    import shutil
+    shutil.copy(graph_json, small_src)
+
+    g = json.loads(graph_json.read_text(encoding="utf-8"))
+    for i in range(10):
+        g["nodes"].append({"id": f"dummy_{i}", "label": f"Dummy{i}", "community": 0})
+    graph_json.write_text(json.dumps(g), encoding="utf-8")
+    # Sentinel report: a refused run must leave ALL graphify-out artifacts
+    # untouched, not just graph.json (report/labels desync — 0.5.1 rule).
+    (out / "GRAPH_REPORT.md").write_text("SENTINEL-REPORT", encoding="utf-8")
+    return graph_json, small_src
+
+
+def _env_without_force() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("GRAPHIFY_FORCE", None)
+    return env
+
+
+def test_cluster_only_shrink_guard_blocks_and_reports(tmp_path):
+    """Without --force, the refused write must be reported honestly (non-zero
+    exit, 'NOT updated' on stderr) and graphify-out must be left untouched —
+    including GRAPH_REPORT.md, which must not desync from the preserved graph.json."""
+    graph_json, small_src = _make_shrink_scenario(tmp_path)
+    before = json.loads(graph_json.read_text(encoding="utf-8"))
+
+    r = _run(["cluster-only", ".", "--graph", str(small_src), "--no-viz", "--no-label"],
+             tmp_path, env=_env_without_force())
+
+    assert r.returncode != 0, "refused write must exit non-zero"
+    assert "NOT updated" in r.stderr
+    after = json.loads(graph_json.read_text(encoding="utf-8"))
+    assert len(after["nodes"]) == len(before["nodes"]), "graph.json must be untouched"
+    report = (tmp_path / "graphify-out" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert report == "SENTINEL-REPORT", "refused run must not rewrite GRAPH_REPORT.md"
+
+
+def test_cluster_only_graphify_force_zero_does_not_force(tmp_path):
+    """GRAPHIFY_FORCE accepts only affirmative values — '0' must still refuse."""
+    graph_json, small_src = _make_shrink_scenario(tmp_path)
+    before = json.loads(graph_json.read_text(encoding="utf-8"))
+    env = _env_without_force()
+    env["GRAPHIFY_FORCE"] = "0"
+
+    r = _run(["cluster-only", ".", "--graph", str(small_src), "--no-viz", "--no-label"],
+             tmp_path, env=env)
+
+    assert r.returncode != 0, "GRAPHIFY_FORCE=0 must not force"
+    assert "NOT updated" in r.stderr
+    after = json.loads(graph_json.read_text(encoding="utf-8"))
+    assert len(after["nodes"]) == len(before["nodes"])
+
+
+def test_cluster_only_force_flag_overrides_shrink_guard(tmp_path):
+    graph_json, small_src = _make_shrink_scenario(tmp_path)
+    small_n = len(json.loads(small_src.read_text(encoding="utf-8"))["nodes"])
+
+    r = _run(["cluster-only", ".", "--graph", str(small_src), "--no-viz", "--no-label", "--force"],
+             tmp_path, env=_env_without_force())
+
+    assert r.returncode == 0, r.stderr
+    after = json.loads(graph_json.read_text(encoding="utf-8"))
+    assert len(after["nodes"]) <= small_n, "--force must allow the smaller write"
+    report = (tmp_path / "graphify-out" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert report != "SENTINEL-REPORT", "successful forced run must regenerate the report"
+
+
+def test_cluster_only_graphify_force_env_overrides_shrink_guard(tmp_path):
+    graph_json, small_src = _make_shrink_scenario(tmp_path)
+    small_n = len(json.loads(small_src.read_text(encoding="utf-8"))["nodes"])
+    env = _env_without_force()
+    env["GRAPHIFY_FORCE"] = "1"
+
+    r = _run(["cluster-only", ".", "--graph", str(small_src), "--no-viz", "--no-label"],
+             tmp_path, env=env)
+
+    assert r.returncode == 0, r.stderr
+    after = json.loads(graph_json.read_text(encoding="utf-8"))
+    assert len(after["nodes"]) <= small_n, "GRAPHIFY_FORCE=1 must allow the smaller write"

@@ -238,3 +238,179 @@ def test_prefix_guard_fires_for_extension_pairs():
         assert hi.startswith(lo) and hi != lo, (
             f"Prefix guard should fire for ({a!r}, {b!r}) but did not"
         )
+
+
+# ── cross-app / cross-language fuzzy-merge guard ─────────────────────────────
+
+def test_cross_app_fuzzy_merge_blocked():
+    """Symbols in different apps (top-level path segment) must never fuzzy-merge,
+    even with a near-identical name. On a multi-app WebForms corpus this rewired
+    call edges across application boundaries (AF_MAL.Btn_Avancer_Click in app A
+    'calling' TRGAFP01.UpdateListNoQuart in app B)."""
+    nodes = [
+        {"id": "a_handler", "label": "Btn_Avancer_Click",
+         "source_file": "IHM_AF_GOFerros/Pages/AF_MAL.aspx.vb"},
+        {"id": "b_handler", "label": "Btn_AvanceD_Click",
+         "source_file": "IHM_AFP_TRG/TRGAFP01.aspx.vb"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 2, "cross-app fuzzy merge must be blocked"
+
+
+def test_cross_language_fuzzy_merge_blocked():
+    """Symbols in different languages (file extension) must never fuzzy-merge,
+    even within the same app — a VB handler is not a C# handler."""
+    nodes = [
+        {"id": "vb_proc", "label": "PRC_ChargementMenu",
+         "source_file": "App/Classes/Animations.vb"},
+        {"id": "cs_proc", "label": "PRC_ChargementMenue",
+         "source_file": "App/Pages/Page1.aspx.cs"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 2, "cross-language fuzzy merge must be blocked"
+
+
+def test_same_app_same_language_typo_still_merges():
+    """Control: the scope guard must not block legitimate fuzzy merges within
+    the same app and language."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor",
+         "source_file": "App/src/a.py"},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "App/src/a.py"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1
+
+
+def test_unknown_scope_does_not_block():
+    """Nodes without a source_file (semantic/doc nodes) have no scope — the
+    guard must not fire, preserving pre-existing merge behavior."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor", "source_file": ""},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "App/src/a.py"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1
+
+
+def test_fuzzy_merge_does_not_vacuum_same_label_nodes_from_other_files():
+    """A fuzzy pair (A, B) must union only A and B. The old code picked the
+    winner from ALL nodes graph-wide sharing either label, pulling same-named
+    symbols from other files into the component — bypassing the #1046
+    same-label-cross-file guard and erasing per-file methods (étape pages lost
+    ~9% of their handlers to same-named siblings)."""
+    nodes = [
+        # the fuzzy pair: same app+lang, different files, near-identical labels
+        {"id": "p1_donneesshaking", "label": "PRC_ChargementDonneesShaking",
+         "source_file": "App/Pages/AF_Brassage.aspx.vb"},
+        {"id": "p2_donneeslots", "label": "PRC_ChargementDonneesLots",
+         "source_file": "App/Pages/AF_Grenaillage.aspx.vb"},
+        # an innocent bystander sharing a pair member's label, in a third file —
+        # must survive untouched
+        {"id": "p3_donneeslots", "label": "PRC_ChargementDonneesLots",
+         "source_file": "App/Pages/AF_MAL.aspx.vb"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    surviving_ids = {n["id"] for n in out_nodes}
+    assert "p3_donneeslots" in surviving_ids, (
+        "same-label node from a third file was vacuumed into a fuzzy pair's merge"
+    )
+
+
+# ── scope-guard refinements (doc exemption, language families, generic dirs) ──
+
+def test_doc_concept_still_merges_into_code_symbol():
+    """The scope guard must NOT block doc<->code unification: a concept node from
+    docs/arch.md merging into its code symbol is deliberately-engineered behavior
+    (it is why _make_minhash strips spaces). Non-code files carry no scope."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor",
+         "source_file": "src/extract.py"},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "docs/arch.md"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1, "doc concept must still merge into code symbol"
+
+
+def test_same_language_family_extensions_do_not_block():
+    """ts/tsx (and py/pyi, c/h, ...) are one language family — the guard must not
+    treat them as different languages."""
+    nodes = [
+        {"id": "usercard", "label": "UserCardWidget",
+         "source_file": "frontend/components/UserCard.tsx"},
+        {"id": "user_card", "label": "User Card Widget",
+         "source_file": "frontend/components/index.ts"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1, "ts/tsx must be one language family"
+
+
+def test_generic_top_dirs_are_not_app_boundaries():
+    """src/ vs lib/ in an ordinary single-app repo are layout convention, not
+    application boundaries — the app axis must not block across them."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor",
+         "source_file": "src/extract.py"},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "lib/extract_helpers.py"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1, "src/ vs lib/ must not be app boundaries"
+
+
+def test_merge_scope_contract():
+    """Pin _merge_scope's documented None-component cases."""
+    from graphify.dedup import _merge_scope
+
+    def scope(sf):
+        return _merge_scope({"source_file": sf})
+
+    assert scope("") == (None, None)                      # no source_file
+    assert scope("docs/arch.md") == (None, None)          # doc file: no scope at all
+    assert scope("C:/x/AppA/a.py") == (None, "py")        # absolute: no app
+    assert scope("/x/AppA/a.py") == (None, "py")          # absolute posix: no app
+    assert scope("a.py") == (None, "py")                  # bare filename: no app
+    assert scope("src/a.py") == (None, "py")              # generic top dir: no app
+    assert scope("AppA/sub/a.py") == ("appa", "py")       # real app dir
+    assert scope("AppA/Page.aspx.vb")[1] == "dotnet-vb"   # family, not raw ext
+    assert scope("AppA/x.ts")[1] == scope("AppB/y.tsx")[1]  # same family
+
+
+def test_llm_tiebreak_respects_cross_scope_gate(monkeypatch):
+    """Pass 3 (LLM tiebreaker) must apply the same app/language gate as Pass 2:
+    even an LLM 'yes, same concept' must not merge across app boundaries."""
+    import graphify.dedup as D
+    import graphify.llm as L
+
+    monkeypatch.setattr(L, "_get_backend_api_key", lambda backend: "fake-key")
+    monkeypatch.setattr(L, "_call_llm",
+                        lambda prompt, backend, max_tokens=200: "1. yes")
+
+    # JW similarity of the norms is ~88.5 (the ambiguous [75, 92) zone Pass 3 arbitrates).
+    cross_app = [
+        {"id": "a_proc", "label": "UpdateListQuart",
+         "source_file": "AppA/Pages/PageA.aspx.vb"},
+        {"id": "b_proc", "label": "UpdateGridNoQuart",
+         "source_file": "AppB/Pages/PageB.aspx.vb"},
+    ]
+    uf = D._UF()
+    D._llm_tiebreak(cross_app, uf, {}, backend="gemini")
+    assert uf.find("a_proc") != uf.find("b_proc"), (
+        "LLM tiebreak merged across an app boundary"
+    )
+
+    # Control: the same pair within one app DOES merge under the same mock.
+    same_app = [
+        {"id": "a_proc", "label": "UpdateListQuart",
+         "source_file": "AppA/Pages/PageA.aspx.vb"},
+        {"id": "b_proc", "label": "UpdateGridNoQuart",
+         "source_file": "AppA/Pages/PageB.aspx.vb"},
+    ]
+    uf2 = D._UF()
+    D._llm_tiebreak(same_app, uf2, {}, backend="gemini")
+    assert uf2.find("a_proc") == uf2.find("b_proc"), (
+        "control pair should merge — the mock/JW-zone setup is broken"
+    )

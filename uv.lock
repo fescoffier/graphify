@@ -1146,7 +1146,7 @@ wheels = [
 
 [[package]]
 name = "graphifyy"
-version = "0.8.35"
+version = "0.8.36"
 source = { editable = "." }
 dependencies = [
     { name = "datasketch" },
@@ -1264,6 +1264,9 @@ svg = [
 terraform = [
     { name = "tree-sitter-hcl" },
 ]
+vb = [
+    { name = "tree-sitter-vb-dotnet" },
+]
 video = [
     { name = "faster-whisper", marker = "python_full_version >= '3.11'" },
     { name = "yt-dlp" },
@@ -1364,6 +1367,7 @@ requires-dist = [
     { name = "tree-sitter-sql", marker = "extra == 'sql'" },
     { name = "tree-sitter-swift" },
     { name = "tree-sitter-typescript" },
+    { name = "tree-sitter-vb-dotnet", marker = "extra == 'vb'", git = "https://github.com/fescoffier/tree-sitter-vb-dotnet" },
     { name = "tree-sitter-verilog" },
     { name = "tree-sitter-zig" },
     { name = "watchdog", marker = "extra == 'all'" },
@@ -1371,7 +1375,7 @@ requires-dist = [
     { name = "yt-dlp", marker = "extra == 'all'" },
     { name = "yt-dlp", marker = "extra == 'video'" },
 ]
-provides-extras = ["mcp", "neo4j", "pdf", "watch", "svg", "leiden", "office", "google", "postgres", "video", "kimi", "ollama", "bedrock", "anthropic", "gemini", "openai", "chinese", "sql", "dm", "terraform", "all"]
+provides-extras = ["mcp", "neo4j", "pdf", "watch", "svg", "leiden", "office", "google", "postgres", "video", "kimi", "ollama", "bedrock", "anthropic", "gemini", "openai", "chinese", "sql", "dm", "terraform", "vb", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -5105,6 +5109,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8b/ab/dd84f0e2337296a5f09749f7b5483215d75c8fa9e33738522e5ed81f7254/tree_sitter_typescript-0.23.2-cp39-abi3-win_amd64.whl", hash = "sha256:3f730b66396bc3e11811e4465c41ee45d9e9edd6de355a58bbbc49fa770da8f9", size = 278015, upload-time = "2024-11-11T02:36:07.631Z" },
     { url = "https://files.pythonhosted.org/packages/9f/e4/81f9a935789233cf412a0ed5fe04c883841d2c8fb0b7e075958a35c65032/tree_sitter_typescript-0.23.2-cp39-abi3-win_arm64.whl", hash = "sha256:05db58f70b95ef0ea126db5560f3775692f609589ed6f8dd0af84b7f19f1cbb7", size = 274052, upload-time = "2024-11-11T02:36:09.514Z" },
 ]
+
+[[package]]
+name = "tree-sitter-vb-dotnet"
+version = "0.1.0"
+source = { git = "https://github.com/fescoffier/tree-sitter-vb-dotnet#9ff34119f25a301c5c5dd235c2828c9d7955bea1" }
 
 [[package]]
 name = "tree-sitter-verilog"
