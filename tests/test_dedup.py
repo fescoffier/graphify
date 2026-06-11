@@ -238,3 +238,82 @@ def test_prefix_guard_fires_for_extension_pairs():
         assert hi.startswith(lo) and hi != lo, (
             f"Prefix guard should fire for ({a!r}, {b!r}) but did not"
         )
+
+
+# ── cross-app / cross-language fuzzy-merge guard ─────────────────────────────
+
+def test_cross_app_fuzzy_merge_blocked():
+    """Symbols in different apps (top-level path segment) must never fuzzy-merge,
+    even with a near-identical name. On a multi-app WebForms corpus this rewired
+    call edges across application boundaries (AF_MAL.Btn_Avancer_Click in app A
+    'calling' TRGAFP01.UpdateListNoQuart in app B)."""
+    nodes = [
+        {"id": "a_handler", "label": "Btn_Avancer_Click",
+         "source_file": "IHM_AF_GOFerros/Pages/AF_MAL.aspx.vb"},
+        {"id": "b_handler", "label": "Btn_AvanceD_Click",
+         "source_file": "IHM_AFP_TRG/TRGAFP01.aspx.vb"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 2, "cross-app fuzzy merge must be blocked"
+
+
+def test_cross_language_fuzzy_merge_blocked():
+    """Symbols in different languages (file extension) must never fuzzy-merge,
+    even within the same app — a VB handler is not a C# handler."""
+    nodes = [
+        {"id": "vb_proc", "label": "PRC_ChargementMenu",
+         "source_file": "App/Classes/Animations.vb"},
+        {"id": "cs_proc", "label": "PRC_ChargementMenue",
+         "source_file": "App/Pages/Page1.aspx.cs"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 2, "cross-language fuzzy merge must be blocked"
+
+
+def test_same_app_same_language_typo_still_merges():
+    """Control: the scope guard must not block legitimate fuzzy merges within
+    the same app and language."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor",
+         "source_file": "App/src/a.py"},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "App/src/a.py"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1
+
+
+def test_unknown_scope_does_not_block():
+    """Nodes without a source_file (semantic/doc nodes) have no scope — the
+    guard must not fire, preserving pre-existing merge behavior."""
+    nodes = [
+        {"id": "graphextractor", "label": "GraphExtractor", "source_file": ""},
+        {"id": "graph_extractor", "label": "Graph Extractor",
+         "source_file": "App/src/a.py"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(out_nodes) == 1
+
+
+def test_fuzzy_merge_does_not_vacuum_same_label_nodes_from_other_files():
+    """A fuzzy pair (A, B) must union only A and B. The old code picked the
+    winner from ALL nodes graph-wide sharing either label, pulling same-named
+    symbols from other files into the component — bypassing the #1046
+    same-label-cross-file guard and erasing per-file methods (étape pages lost
+    ~9% of their handlers to same-named siblings)."""
+    nodes = [
+        # the fuzzy pair: same app+lang, different files, near-identical labels
+        {"id": "p1_donneesshaking", "label": "PRC_ChargementDonneesShaking",
+         "source_file": "App/Pages/AF_Brassage.aspx.vb"},
+        {"id": "p2_donneeslots", "label": "PRC_ChargementDonneesLots",
+         "source_file": "App/Pages/AF_Grenaillage.aspx.vb"},
+        # an innocent bystander sharing a pair member's label, in a third file —
+        # must survive untouched
+        {"id": "p3_donneeslots", "label": "PRC_ChargementDonneesLots",
+         "source_file": "App/Pages/AF_MAL.aspx.vb"},
+    ]
+    out_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    surviving_ids = {n["id"] for n in out_nodes}
+    assert "p3_donneeslots" in surviving_ids, (
+        "same-label node from a third file was vacuumed into a fuzzy pair's merge"
+    )

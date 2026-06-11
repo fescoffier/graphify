@@ -89,6 +89,46 @@ def _short_label_blocked(a: str, b: str, jw_score: float) -> bool:
     return True
 
 
+def _merge_scope(node: dict) -> tuple[str | None, str | None]:
+    """Return the (app, language) fuzzy-merge scope of a node's ``source_file``.
+
+    ``app`` is the top-level path segment — in a multi-application monorepo each
+    app lives under its own top-level directory, and same-ish symbol names across
+    apps are naming convention, not identity. ``lang`` is the file extension.
+    Either component is None when it cannot be determined (no source_file, no
+    directory part, absolute path for app, extensionless file for lang); a None
+    component never blocks a merge.
+    """
+    sf = str(node.get("source_file") or "").replace("\\", "/")
+    if sf.startswith("./"):
+        sf = sf[2:]
+    if not sf:
+        return None, None
+    name = sf.rsplit("/", 1)[-1]
+    # name[1:] so dotfiles (".gitignore") don't read as an extension.
+    lang = name[1:].rsplit(".", 1)[-1].casefold() if "." in name[1:] else None
+    app = None
+    # The top segment is only meaningful for relative paths (the pipeline
+    # relativizes source_file to the project root before dedup runs).
+    if "/" in sf and not sf.startswith("/") and not re.match(r"^[A-Za-z]:", sf):
+        app = sf.split("/", 1)[0].casefold()
+    return app, lang
+
+
+def _cross_scope_blocked(a: dict, b: dict) -> bool:
+    """True when two nodes provably come from different applications (top-level
+    path segment) or different languages (file extension) — such pairs are never
+    fuzzy-merge candidates (#defect: a VB symbol in one app merging with a
+    similarly-named C# symbol in another app rewires call edges across apps)."""
+    app_a, lang_a = _merge_scope(a)
+    app_b, lang_b = _merge_scope(b)
+    if app_a is not None and app_b is not None and app_a != app_b:
+        return True
+    if lang_a is not None and lang_b is not None and lang_a != lang_b:
+        return True
+    return False
+
+
 # ── union-find ────────────────────────────────────────────────────────────────
 
 class _UF:
@@ -252,6 +292,13 @@ def deduplicate_entities(
                 _lo, _hi = sorted((norm_label, neighbor_norm), key=len)
                 if _hi.startswith(_lo) and _hi != _lo:
                     continue
+                # Different application (top-level path segment) or different
+                # language (extension) — never a true duplicate, regardless of
+                # JW score. Without this, a VB page handler fuzzy-merges with a
+                # similarly-named C# handler in a sibling app and every call
+                # edge to the loser gets rewired across the app boundary.
+                if _cross_scope_blocked(node, neighbor):
+                    continue
 
                 c1 = communities.get(node_id)
                 c2 = communities.get(neighbor_id)
@@ -269,9 +316,13 @@ def deduplicate_entities(
                         sf_b = neighbor.get("source_file") or ""
                         if sf_a != sf_b:
                             continue
-                    all_group = norm_to_nodes.get(norm_label, [node]) + \
-                                norm_to_nodes.get(neighbor_norm, [neighbor])
-                    winner = _pick_winner(all_group)
+                    # Union only the verified pair. Picking the winner from the
+                    # full norm-label groups (all nodes graph-wide sharing either
+                    # label) used to vacuum same-named symbols from *other* files
+                    # into this component — bypassing the #1046 cross-file guard
+                    # above and erasing per-file methods (a page lost ~9% of its
+                    # handlers to same-named siblings on a WebForms corpus).
+                    winner = _pick_winner([node, neighbor])
                     uf.union(winner["id"], node_id)
                     uf.union(winner["id"], neighbor_id)
                     fuzzy_merges += 1
@@ -381,6 +432,10 @@ def _llm_tiebreak(
                 continue
             _lo, _hi = sorted((norm_i, norm_j), key=len)
             if _hi.startswith(_lo) and _hi != _lo:
+                continue
+            # Same app/language gate as Pass 2 — an LLM "yes, same concept" must
+            # not merge symbols across application or language boundaries either.
+            if _cross_scope_blocked(node, neighbor):
                 continue
             c1 = communities.get(node["id"])
             c2 = communities.get(neighbor["id"])
