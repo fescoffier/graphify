@@ -423,6 +423,206 @@ def test_vb_ts_structure_parity_with_regex():
     assert len(ts_labels) >= len(set(_labels(rx)))
 
 
+@_needs_vb
+def test_vb_ts_no_dangling_edge_endpoints_any_relation():
+    """Every edge endpoint must be a real node, for ALL relations — imports and
+    inherits targets included (stubs count: they are sourceless but real nodes)."""
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in ids, f"dangling source on {e['relation']}: {e['source']}"
+        assert e["target"] in ids, f"dangling target on {e['relation']}: {e['target']}"
+
+
+@_needs_vb
+def test_vb_nested_types_fall_back_to_regex(tmp_path):
+    """tree-sitter-vb-dotnet cannot parse nested types: the inner declaration
+    mangles into field_declaration/ERROR and every outer member after the inner
+    `End Class` vanishes into a top-level ERROR node. extract_vb must detect the
+    dropped type (textual count > tree count) and fall back to the regex scanner,
+    whose frame stack nests correctly."""
+    src = tmp_path / "nested.vb"
+    src.write_text(
+        "Public Class Container\n"
+        "    Public Class Helper\n"
+        "        Public Sub HelperWork()\n"
+        "        End Sub\n"
+        "    End Class\n"
+        "\n"
+        "    Public Sub ContainerMethod()\n"
+        "    End Sub\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    from graphify.extract import extract_vb
+    r = extract_vb(src)
+    labels = set(_labels(r))
+    # The tree-sitter walk loses Helper (as a type) and ContainerMethod entirely.
+    for name in ("Container", "Helper", "HelperWork", "ContainerMethod"):
+        assert name in labels, f"nested-type extraction lost {name!r}"
+    # Helper must be contained as a TYPE (under Container), and HelperWork under
+    # Helper — not attributed to Container.
+    contains = _edge_labels(r, "contains")
+    assert ("Helper", "HelperWork") in contains
+    assert ("Container", "ContainerMethod") in contains
+
+
+@_needs_vb
+def test_vb_ts_inherits_clause_edge_cases(tmp_path):
+    """Trailing comments, interface multi-base Inherits, generic Implements, and
+    the single-line colon form must all produce exactly the right base edges."""
+    src = tmp_path / "bases.vb"
+    src.write_text(
+        "Public Class WithComment\n"
+        "    Inherits Base ' legacy base, do not remove\n"
+        "End Class\n"
+        "\n"
+        "Public Interface IBoth\n"
+        "    Inherits IA, IB\n"
+        "End Interface\n"
+        "\n"
+        "Public Class GenericImpl\n"
+        "    Implements IDictionary(Of String, IList(Of Foo))\n"
+        "End Class\n"
+        "\n"
+        "Public Class ColonStyle : Inherits BaseThing\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_treesitter(src)
+    assert "error" not in r
+    inherits = _edge_labels(r, "inherits")
+    implements = _edge_labels(r, "implements")
+    assert ("WithComment", "Base") in inherits, "comment'd Inherits dropped"
+    assert ("IBoth", "IA") in inherits and ("IBoth", "IB") in inherits, \
+        "interface multi-base Inherits dropped"
+    assert ("ColonStyle", "BaseThing") in inherits, "colon-form Inherits dropped"
+    assert ("GenericImpl", "IDictionary") in implements
+    # The generic's type ARGUMENTS must not leak as implemented interfaces.
+    impl_targets = {t for _s, t in implements}
+    assert "IList" not in impl_targets and "Foo" not in impl_targets, \
+        "generic type arguments leaked as implements edges"
+
+
+@_needs_vb
+def test_vb_ts_framework_base_resolves_to_stub(tmp_path):
+    """A qualified framework base (`Inherits System.Web.UI.Page`) must clean to
+    its bare name and target a sourceless stub node, ready for corpus-wide
+    rewiring by _rewire_unique_stub_nodes."""
+    src = tmp_path / "page.vb"
+    src.write_text(
+        "Public Class MyPage\n"
+        "    Inherits System.Web.UI.Page\n"
+        "    Implements IDisposable\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_treesitter(src)
+    assert ("MyPage", "Page") in _edge_labels(r, "inherits")
+    assert ("MyPage", "IDisposable") in _edge_labels(r, "implements")
+    stub = next(n for n in r["nodes"] if n["label"] == "Page")
+    assert stub["source_file"] == "", "framework base must be a sourceless stub"
+
+
+@_needs_vb
+def test_vb_ts_alias_and_multiclause_imports(tmp_path):
+    """`Imports A, B` emits one edge per clause; `Imports F = X.Y.Z` targets the
+    real namespace (Z), never the file-local alias (F)."""
+    src = tmp_path / "imp.vb"
+    src.write_text(
+        "Imports System.IO, System.Text\n"
+        "Imports Frm = System.Windows.Forms\n"
+        "Public Class C\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_treesitter(src)
+    import_targets = {t for _s, t in _edge_labels(r, "imports")}
+    assert {"IO", "Text", "Forms"} <= import_targets
+    assert "Frm" not in {n["label"] for n in r["nodes"]}, \
+        "import alias must not become a node"
+
+
+def test_vb_regex_alias_and_multiclause_imports(tmp_path):
+    src = tmp_path / "imp.vb"
+    src.write_text(
+        "Imports System.IO, System.Text\n"
+        "Imports Frm = System.Windows.Forms\n"
+        "Public Class C\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_regex(src)
+    import_targets = {t for _s, t in _edge_labels(r, "imports")}
+    assert {"IO", "Text", "Forms"} <= import_targets
+    assert "Frm" not in {n["label"] for n in r["nodes"]}
+
+
+def test_vb_regex_handles_utf8_bom(tmp_path):
+    """Visual Studio writes a UTF-8 BOM by default. The regex scanner must not
+    lose the line-1 construct (here: the entire class) to a U+FEFF prefix."""
+    src = tmp_path / "bom.vb"
+    src.write_bytes(
+        b"\xef\xbb\xbfPublic Class BomClass\n"
+        b"    Inherits Base\n"
+        b"    Public Sub Work()\n"
+        b"    End Sub\n"
+        b"End Class\n"
+    )
+    r = _extract_vb_regex(src)
+    labels = set(_labels(r))
+    assert "BomClass" in labels and "Work" in labels
+    assert ("BomClass", "Base") in _edge_labels(r, "inherits")
+
+
+def test_vb_regex_colon_form_and_multibase(tmp_path):
+    src = tmp_path / "colon.vb"
+    src.write_text(
+        "Public Class ColonStyle : Inherits BaseThing\n"
+        "End Class\n"
+        "Public Interface IBoth\n"
+        "    Inherits IA, IB\n"
+        "End Interface\n",
+        encoding="utf-8",
+    )
+    r = _extract_vb_regex(src)
+    inherits = _edge_labels(r, "inherits")
+    assert ("ColonStyle", "BaseThing") in inherits
+    assert ("IBoth", "IA") in inherits and ("IBoth", "IB") in inherits
+
+
+@_needs_vb
+def test_vb_cross_file_new_resolves_as_references(tmp_path):
+    """End-to-end: a deferred `New X` raw_call must resolve cross-file with
+    relation='references'/context='type' (not 'calls') via extract()'s resolver."""
+    (tmp_path / "target.vb").write_text(
+        "Public Class UniqueVbTargetXyz\n"
+        "    Public Sub New(ByVal seed As Integer)\n"
+        "    End Sub\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "user.vb").write_text(
+        "Public Class Consumer\n"
+        "    Public Sub Use()\n"
+        "        Dim t As Object\n"
+        "        t = New UniqueVbTargetXyz(5)\n"
+        "    End Sub\n"
+        "End Class\n",
+        encoding="utf-8",
+    )
+    from graphify.extract import extract
+    result = extract([tmp_path / "target.vb", tmp_path / "user.vb"],
+                     cache_root=tmp_path, parallel=False)
+    label_by_id = {n["id"]: n["label"] for n in result["nodes"]}
+    cross = [e for e in result["edges"]
+             if label_by_id.get(e["target"]) == "UniqueVbTargetXyz"
+             and label_by_id.get(e["source"]) == "Use"]
+    assert cross, "cross-file New did not resolve to an edge"
+    assert cross[0]["relation"] == "references"
+    assert cross[0].get("context") == "type"
+
+
 def test_java_normalizes_inherits_and_implements():
     result = extract_java(FIXTURES / "sample.java")
     assert ("DataProcessor", "BaseProcessor") in _edge_labels(result, "inherits")

@@ -4102,7 +4102,10 @@ def _extract_vb_regex(path: Path) -> dict:
     add_node(file_nid, path.name, 1)
 
     try:
-        source = path.read_text(encoding="utf-8", errors="replace")
+        # utf-8-sig: Visual Studio writes a UTF-8 BOM by default; plain utf-8
+        # would leave U+FEFF glued to line 1, silently breaking every anchored
+        # regex below for the first construct (the whole class, if declared there).
+        source = path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return {"nodes": nodes, "edges": edges}
 
@@ -4121,14 +4124,14 @@ def _extract_vb_regex(path: Path) -> dict:
                 return frame["nid"]
         return file_nid
 
-    _re_imports = re.compile(r"(?i)^Imports\s+([A-Za-z_][\w.]*)")
+    _re_imports = re.compile(r"(?i)^Imports\s+(.+)")
     _re_namespace = re.compile(r"(?i)^Namespace\s+([A-Za-z_][\w.]*)")
     _re_type = re.compile(
         r"(?i)^(?:(?:Public|Private|Protected|Friend|Partial|MustInherit|"
         r"NotInheritable|Shared|Shadows|Overloads|Default|Global)\s+)*"
         r"(Class|Module|Interface|Structure|Enum)\s+([A-Za-z_]\w*)"
     )
-    _re_inherits = re.compile(r"(?i)^Inherits\s+([A-Za-z_][\w.]*)")
+    _re_inherits = re.compile(r"(?i)^Inherits\s+(.+)")
     _re_implements = re.compile(r"(?i)^Implements\s+(.+)")
     _re_member = re.compile(
         r"(?i)^(?:(?:Public|Private|Protected|Friend|Shared|Overrides|Overridable|"
@@ -4138,6 +4141,16 @@ def _extract_vb_regex(path: Path) -> dict:
     )
     _re_end = re.compile(r"(?i)^End\s+(Class|Module|Interface|Structure|Enum|Namespace)")
 
+    def _emit_bases(payload: str, relation: str, src_nid: str, at_line: int) -> None:
+        for part in _vb_split_bases(payload):
+            base = _vb_clean_type_name(part)
+            if not re.fullmatch(r"\w+", base):
+                continue
+            base_nid = _make_id(base)
+            if base_nid not in seen_ids:
+                add_node(base_nid, base, at_line, source_file="", source_location="")
+            add_edge(src_nid, base_nid, relation, at_line)
+
     for lineno, raw_line in enumerate(source.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
@@ -4146,12 +4159,21 @@ def _extract_vb_regex(path: Path) -> dict:
         # Imports
         m = _re_imports.match(line)
         if m:
-            name = m.group(1)
-            last = name.split(".")[-1]
-            tgt = _make_id(last)
-            if tgt not in seen_ids:
-                add_node(tgt, last, lineno, source_file="", source_location="")
-            add_edge(file_nid, tgt, "imports", lineno, context="import")
+            # One edge per comma clause; aliased imports (`Imports F = X.Y`)
+            # target the namespace, not the file-local alias.
+            for clause in _vb_split_bases(m.group(1)):
+                if clause.startswith("<"):
+                    continue  # XML namespace import — no graph signal
+                if "=" in clause:
+                    clause = clause.split("=", 1)[1].strip()
+                m_name = re.match(r"[A-Za-z_][\w.]*", clause)
+                if not m_name:
+                    continue
+                last = m_name.group(0).split(".")[-1]
+                tgt = _make_id(last)
+                if tgt not in seen_ids:
+                    add_node(tgt, last, lineno, source_file="", source_location="")
+                add_edge(file_nid, tgt, "imports", lineno, context="import")
             continue
 
         # Namespace
@@ -4172,29 +4194,24 @@ def _extract_vb_regex(path: Path) -> dict:
             add_node(type_nid, name, lineno)
             add_edge(enclosing_container(), type_nid, "contains", lineno)
             frames.append({"kind": keyword.lower(), "nid": type_nid, "is_type": True})
+            # Single-line colon form: `Class X : Inherits Y : Implements I`.
+            rest = line[m.end():]
+            for kw, rel in (("Inherits", "inherits"), ("Implements", "implements")):
+                m0 = re.search(rf"(?i):\s*{kw}\s+([^:]+)", rest)
+                if m0:
+                    _emit_bases(m0.group(1), rel, type_nid, lineno)
             continue
 
-        # Inherits (only inside a type)
+        # Inherits (only inside a type; may list several bases for interfaces)
         m = _re_inherits.match(line)
         if m and enclosing_type():
-            base = m.group(1).split(".")[-1]
-            base_nid = _make_id(base)
-            if base_nid not in seen_ids:
-                add_node(base_nid, base, lineno, source_file="", source_location="")
-            add_edge(enclosing_type(), base_nid, "inherits", lineno)
+            _emit_bases(m.group(1), "inherits", enclosing_type(), lineno)
             continue
 
         # Implements (class-level: line STARTS with Implements)
         m = _re_implements.match(line)
         if m and enclosing_type():
-            for item in m.group(1).split(","):
-                item = item.strip().split(".")[-1]
-                if not item:
-                    continue
-                base_nid = _make_id(item)
-                if base_nid not in seen_ids:
-                    add_node(base_nid, item, lineno, source_file="", source_location="")
-                add_edge(enclosing_type(), base_nid, "implements", lineno)
+            _emit_bases(m.group(1), "implements", enclosing_type(), lineno)
             continue
 
         # Member (only inside a type)
@@ -4232,6 +4249,41 @@ def _vb_clean_type_name(text: str) -> str:
     (`List(Of T)`, `String()`) and namespace qualifiers (`System.Web.UI.Page`)."""
     text = re.split(r"[(\[<]", text, maxsplit=1)[0]
     return text.split(".")[-1].strip()
+
+
+# Textual count of type declarations, used by extract_vb to detect grammar
+# corruption: tree-sitter-vb-dotnet cannot parse NESTED types (Class-in-Class
+# mangles into field_declaration/ERROR nodes and every outer-type member after
+# the inner `End Class` is dumped into a top-level ERROR node). When the source
+# declares more types than the tree produced, the walk is structurally wrong.
+_VB_TYPE_DECL_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:Public|Private|Protected|Friend|Partial|MustInherit|"
+    r"NotInheritable|Shared|Shadows|Overloads|Default|Global)\s+)*"
+    r"(?:Class|Module|Interface|Structure|Enum)\s+[A-Za-z_]\w*"
+)
+
+
+def _vb_split_bases(payload: str) -> list[str]:
+    """Split an Inherits/Implements payload on top-level commas only, so generic
+    argument lists never leak as bases (`Implements IDictionary(Of String,
+    IList(Of Foo))` must not produce an `IList` base). Trailing `'` comments are
+    stripped first — string literals cannot appear in these clauses."""
+    payload = payload.split("'", 1)[0]
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in payload:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    parts.append("".join(cur))
+    return [p for p in (x.strip() for x in parts) if p]
 
 
 def _extract_vb_treesitter(path: Path) -> dict:
@@ -4405,15 +4457,24 @@ def _extract_vb_treesitter(path: Path) -> dict:
 
             elif ntype == "imports_statement":
                 raw = _read_text(node, source)
-                tokens = re.findall(r"[A-Za-z_][\w.]*", raw)
-                # First token is the "Imports" keyword; the rest hold the name.
-                for tok in tokens[1:]:
-                    last = tok.split(".")[-1]
-                    if last and last.casefold() != "imports":
-                        tgt = _make_id(last)
-                        add_stub(tgt, last)
-                        add_edge(file_nid, tgt, "imports", line, context="import")
-                        break
+                m_imp = re.match(r"(?is)^\s*Imports\s+(.+)$", raw)
+                if m_imp:
+                    # One edge per comma-separated clause (`Imports A, B`).
+                    for clause in _vb_split_bases(m_imp.group(1)):
+                        if clause.startswith("<"):
+                            continue  # XML namespace import — no graph signal
+                        # Aliased import (`Imports Frm = System.Windows.Forms`):
+                        # the alias is a file-local name; target the namespace.
+                        if "=" in clause:
+                            clause = clause.split("=", 1)[1].strip()
+                        m_name = re.match(r"[A-Za-z_][\w.]*", clause)
+                        if not m_name:
+                            continue
+                        last = m_name.group(0).split(".")[-1]
+                        if last:
+                            tgt = _make_id(last)
+                            add_stub(tgt, last)
+                            add_edge(file_nid, tgt, "imports", line, context="import")
                 return
 
             for child in node.children:
@@ -4440,18 +4501,30 @@ def _extract_vb_treesitter(path: Path) -> dict:
             base_line0 = type_node.start_point[0]
             for i, raw_line in enumerate(_read_text(type_node, source).split("\n")):
                 if i == 0:
-                    continue  # the `... Class X` declaration line itself
+                    # Declaration line. Handle the single-line colon form
+                    # (`Class X : Inherits Y : Implements I`) — its clauses
+                    # never appear on a continuation line of their own.
+                    for kw, rel in (("Inherits", "inherits"), ("Implements", "implements")):
+                        m0 = re.search(rf"(?i):\s*{kw}\s+([^:]+)", raw_line)
+                        if m0:
+                            for part in _vb_split_bases(m0.group(1)):
+                                emit_base(type_nid, _vb_clean_type_name(part),
+                                          rel, base_line0 + 1)
+                    continue
                 s = raw_line.strip()
                 if not s:
                     continue
                 m = re.match(r"(?i)^Inherits\s+(.+)", s)
                 if m:
-                    base = _vb_clean_type_name(m.group(1))  # single base
-                    emit_base(type_nid, base, "inherits", base_line0 + i + 1)
+                    # Classes have a single base, but interfaces may list
+                    # several (`Inherits IA, IB`) — split like Implements.
+                    for part in _vb_split_bases(m.group(1)):
+                        emit_base(type_nid, _vb_clean_type_name(part),
+                                  "inherits", base_line0 + i + 1)
                     continue
                 m = re.match(r"(?i)^Implements\s+(.+)", s)
                 if m:
-                    for part in m.group(1).split(","):
+                    for part in _vb_split_bases(m.group(1)):
                         emit_base(type_nid, _vb_clean_type_name(part),
                                   "implements", base_line0 + i + 1)
                     continue
@@ -4541,16 +4614,28 @@ def _extract_vb_treesitter(path: Path) -> dict:
             for child in member_node.children:
                 walk_calls(child, member_nid, owner_nid)
 
-        return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
+        textual_types = len(
+            _VB_TYPE_DECL_RE.findall(source.decode("utf-8-sig", errors="replace"))
+        )
+        return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls,
+                "_vb_type_counts": (len(type_nodes), textual_types)}
     except Exception as e:  # noqa: BLE001 - must never crash the pipeline
         return {"nodes": [], "edges": [], "error": str(e)}
 
 
 def extract_vb(path: Path) -> dict:
     """Extract VB.NET constructs, preferring tree-sitter and falling back to the
-    dependency-free regex scanner when the grammar is unavailable."""
+    dependency-free regex scanner when the grammar is unavailable or when it
+    mis-parsed the file's structure (nested types — see _VB_TYPE_DECL_RE)."""
     result = _extract_vb_treesitter(path)
     if "error" in result or len(result.get("nodes", [])) <= 1:
+        return _extract_vb_regex(path)
+    tree_types, textual_types = result.pop("_vb_type_counts", (0, 0))
+    if textual_types > tree_types:
+        # The grammar dropped at least one declared type (nested types mangle
+        # into field_declaration/ERROR and trailing members vanish). The regex
+        # scanner's frame stack handles nesting correctly — prefer correct
+        # structure over the tree walker's richer call edges.
         return _extract_vb_regex(path)
     return result
 

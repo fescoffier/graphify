@@ -309,11 +309,13 @@ def resolve_cross_file_raw_calls(
 ) -> list[dict[str, Any]]:
     """Resolve unqualified raw calls conservatively after all files are known.
 
-    This intentionally preserves Graphify's existing behavior:
+    Mirrors the resolver loop in ``extract()``:
     - member calls are skipped;
     - ambiguous labels are skipped;
     - only a single unique candidate is emitted;
-    - emitted edges are INFERRED because the raw call alone is not import proof.
+    - emitted edges are INFERRED because the raw call alone is not import proof;
+    - a raw call may carry an explicit relation/context (e.g. VB ``New X``
+      instantiations deferred as ``references``); default is calls/call.
     """
 
     label_index = build_label_index(all_nodes)
@@ -335,7 +337,8 @@ def resolve_cross_file_raw_calls(
             continue
         if target == caller:
             continue
-        pair = (caller, target, "calls")
+        relation = raw_call.get("relation", "calls")
+        pair = (caller, target, relation)
         if pair in known_pairs:
             continue
         known_pairs.add(pair)
@@ -343,8 +346,8 @@ def resolve_cross_file_raw_calls(
             {
                 "source": caller,
                 "target": target,
-                "relation": "calls",
-                "context": "call",
+                "relation": relation,
+                "context": raw_call.get("context", "call"),
                 "confidence": "INFERRED",
                 "confidence_score": 0.8,
                 "source_file": raw_call.get("source_file", ""),
