@@ -2131,8 +2131,12 @@ def main() -> None:
         print("    --graph <path>          path to graph.json (default <path>/graphify-out/graph.json)")
         print("    --no-label              keep 'Community N' placeholders (skip LLM community naming)")
         print("    --backend=<name>        backend to use for community naming (default: auto-detect)")
+        print("    --force                 overwrite graph.json even if it has fewer nodes than before")
+        print("                            (also: GRAPHIFY_FORCE=1 env var)")
         print("  label <path>            (re)name communities with the configured LLM backend, regenerate report")
         print("    --backend=<name>        backend to use (default: auto-detect from API keys)")
+        print("    --force                 overwrite graph.json even if it has fewer nodes than before")
+        print("                            (also: GRAPHIFY_FORCE=1 env var)")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
@@ -3118,6 +3122,11 @@ def main() -> None:
         # the optional positional path can appear in any order (#724).
         no_viz = "--no-viz" in sys.argv
         no_label = "--no-label" in sys.argv
+        # Same semantics as `update` (L3250): a legitimate dedup/re-cluster shrink
+        # trips to_json's #479 guard, and cluster-only had no way past it.
+        co_force = "--force" in sys.argv or (
+            os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
+        )
         _backend_arg = next((a for a in sys.argv if a.startswith("--backend=")), None)
         label_backend = _backend_arg.split("=", 1)[1] if _backend_arg else None
         _min_cs_arg = next((a for a in sys.argv if a.startswith("--min-community-size=")), None)
@@ -3221,10 +3230,22 @@ def main() -> None:
                           {"warning": "cluster-only mode — file stats not available"},
                           tokens, str(watch_path), suggested_questions=questions,
                           min_community_size=min_community_size, built_at_commit=_commit)
-        (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
         from graphify.export import backup_if_protected as _backup
         _backup(out)
-        to_json(G, communities, str(out / "graph.json"))
+        # graph.json is written FIRST: when the #479 shrink guard refuses it,
+        # skipping the sibling writes keeps graphify-out/ consistent — otherwise
+        # GRAPH_REPORT.md/labels/graph.html would describe a clustering that
+        # graph.json does not contain (the 0.5.1 desync rule).
+        wrote_graph = to_json(G, communities, str(out / "graph.json"), force=co_force)
+        if not wrote_graph:
+            print(
+                "graph.json NOT updated (shrink guard) — GRAPH_REPORT.md, labels "
+                "and graph.html left unchanged to stay in sync. Re-run with "
+                "--force or GRAPHIFY_FORCE=1 if the node reduction is expected.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
         labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
 
         # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
