@@ -1367,7 +1367,7 @@ requires-dist = [
     { name = "tree-sitter-sql", marker = "extra == 'sql'" },
     { name = "tree-sitter-swift" },
     { name = "tree-sitter-typescript" },
-    { name = "tree-sitter-vb-dotnet", marker = "extra == 'vb'", git = "https://github.com/CodeAnt-AI/tree-sitter-vb-dotnet" },
+    { name = "tree-sitter-vb-dotnet", marker = "extra == 'vb'", git = "https://github.com/fescoffier/tree-sitter-vb-dotnet" },
     { name = "tree-sitter-verilog" },
     { name = "tree-sitter-zig" },
     { name = "watchdog", marker = "extra == 'all'" },
@@ -5113,7 +5113,7 @@ wheels = [
 [[package]]
 name = "tree-sitter-vb-dotnet"
 version = "0.1.0"
-source = { git = "https://github.com/CodeAnt-AI/tree-sitter-vb-dotnet#cfca210ce8fdcb5245bd9cd5c47ce0a21a8488d5" }
+source = { git = "https://github.com/fescoffier/tree-sitter-vb-dotnet#9ff34119f25a301c5c5dd235c2828c9d7955bea1" }
 
 [[package]]
 name = "tree-sitter-verilog"

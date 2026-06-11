@@ -333,6 +333,96 @@ def test_vb_imports():
     assert "Generic" in targets
 
 
+# ── VB.NET tree-sitter walker ──────────────────────────────────────────────────
+# The tree-sitter-vb-dotnet grammar is an optional [vb] extra (not on PyPI), so
+# these tests skip when it is absent and the hybrid extractor falls back to regex.
+
+from graphify.extract import _extract_vb_treesitter  # noqa: E402
+
+_needs_vb = pytest.mark.skipif(
+    _ilu.find_spec("tree_sitter_tree_sitter_vb_dotnet") is None,
+    reason="tree-sitter-vb-dotnet not installed (optional [vb] extra)",
+)
+
+_VB_TS_FIXTURE = FIXTURES / "sample_vb_treesitter.vb"
+
+
+@_needs_vb
+def test_vb_ts_no_error():
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    assert "error" not in r
+    # The grammar must actually parse structure, not bail to the regex fallback.
+    assert len(r["nodes"]) > 1
+
+
+@_needs_vb
+def test_vb_ts_calls_attributed_to_enclosing_member():
+    # Defect #1: calls must originate from the calling *method*, not the class,
+    # and resolve to the same-file qualified node id (not a dangling bare id).
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    calls = _calls(r)
+    assert ("FCT_MALOInitial", "FCT_AdaptORMAL") in calls
+    assert ("FCT_MALOInitial", "FCT_RecupMalParDefaut") in calls
+    assert ("Compute", "FCT_MALOInitial") in calls
+    # Resolve to a sibling method in the same class: FCT_RecupMalParDefaut -> Base.
+    assert ("FCT_RecupMalParDefaut", "Base") in calls
+    # Every calls edge endpoint must be a real node (no dangling bare-name ids).
+    ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        if e["relation"] == "calls":
+            assert e["source"] in ids and e["target"] in ids
+
+
+@_needs_vb
+def test_vb_ts_inherits_and_implements_resolve_same_file():
+    # Defect #2: Inherits/Implements (which the grammar does NOT parse as clause
+    # nodes) must be recovered and resolved to same-file qualified type ids.
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    inherits = _edge_labels(r, "inherits")
+    assert ("EtapeElaboration", "Etape") in inherits
+    assert ("Soufflage", "EtapeElaboration") in inherits
+    assert ("EtapeElaboration", "IEtape") in _edge_labels(r, "implements")
+    # Same-file base targets must point at the real (sourced) type node.
+    src_by_id = {n["id"]: n["source_file"] for n in r["nodes"]}
+    label_by_id = {n["id"]: n["label"] for n in r["nodes"]}
+    for e in r["edges"]:
+        if e["relation"] == "inherits" and label_by_id.get(e["target"]) == "EtapeElaboration":
+            assert src_by_id.get(e["target"]), "same-file base resolved to a sourceless stub"
+
+
+@_needs_vb
+def test_vb_ts_new_instantiation_emits_reference():
+    # Defect #3: `New <SameFileType>` produces a references edge from the member.
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    refs = {(s, t) for s, t, _e in _references(r)}
+    assert ("FCT_MALOInitial", "Recherche") in refs
+
+
+@_needs_vb
+def test_vb_ts_cross_file_call_deferred_to_raw_calls():
+    # Member calls into other files are deferred for the cross-file resolver,
+    # never emitted as dangling same-file edges.
+    r = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    deferred = {rc["callee"] for rc in r.get("raw_calls", [])}
+    assert "DoExternalThing" in deferred
+    # Constructor invocations (MyBase.New) carry no call-graph signal.
+    assert not any(rc["callee"].casefold() == "new" for rc in r.get("raw_calls", []))
+
+
+@_needs_vb
+def test_vb_ts_structure_parity_with_regex():
+    # Structure must not regress versus the regex scanner: every type and member
+    # the regex finds should also be present in the tree-sitter output.
+    ts = _extract_vb_treesitter(_VB_TS_FIXTURE)
+    rx = _extract_vb_regex(_VB_TS_FIXTURE)
+    ts_labels = set(_labels(ts))
+    for name in ("Etape", "EtapeElaboration", "Soufflage", "Recherche", "IEtape",
+                 "FCT_MALOInitial", "FCT_AdaptORMAL", "FCT_RecupMalParDefaut", "Base"):
+        assert name in ts_labels, f"tree-sitter missing {name!r}"
+    # Tree-sitter should be at least as complete as regex on types/members.
+    assert len(ts_labels) >= len(set(_labels(rx)))
+
+
 def test_java_normalizes_inherits_and_implements():
     result = extract_java(FIXTURES / "sample.java")
     assert ("DataProcessor", "BaseProcessor") in _edge_labels(result, "inherits")

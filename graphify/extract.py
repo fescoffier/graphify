@@ -4041,6 +4041,24 @@ def extract_csharp(path: Path) -> dict:
     return _extract_generic(path, _CSHARP_CONFIG)
 
 
+# VB.NET intrinsic functions and conversion operators that parse as `invocation`
+# nodes but are not user-defined calls. Skipped during call resolution (matched
+# case-insensitively) so they never produce spurious edges or raw_calls. "New"
+# is here because constructor invocations (`MyBase.New()`, `As New Foo(...)` split
+# by the grammar) carry no useful call-graph signal. Kept deliberately small —
+# the same-file symbol check and cross-file uniqueness guard filter the rest.
+_VB_BUILTIN_CALL_NAMES: frozenset[str] = frozenset(n.casefold() for n in {
+    "New",
+    # Type-conversion operators
+    "CBool", "CByte", "CChar", "CDate", "CDbl", "CDec", "CInt", "CLng",
+    "CObj", "CSByte", "CShort", "CSng", "CStr", "CType", "CUInt", "CULng",
+    "CUShort", "DirectCast", "TryCast",
+    # Common intrinsics that are not user methods
+    "IsNothing", "IsNumeric", "IsDBNull", "IsArray", "IsDate", "GetType",
+    "Nameof", "TypeOf",
+})
+
+
 def _extract_vb_regex(path: Path) -> dict:
     """Dependency-free, case-insensitive line scanner for VB.NET (.vb) source.
 
@@ -4199,12 +4217,40 @@ def _extract_vb_regex(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def _extract_vb_treesitter(path: Path) -> dict:
-    """Self-contained tree-sitter walker for VB.NET. Returns an error dict (never
-    raises) so the hybrid extractor can fall back to the regex scanner cleanly.
+_VB_TYPE_TYPES = frozenset({
+    "class_block", "module_block", "interface_block",
+    "structure_block", "enum_block",
+})
+_VB_MEMBER_TYPES = frozenset({
+    "method_declaration", "constructor_declaration",
+    "property_declaration", "event_declaration",
+})
 
-    The grammar (tree-sitter-vb-dotnet) is not on PyPI, so this path is rarely
-    exercised; it is written defensively with a clean fallback over completeness."""
+
+def _vb_clean_type_name(text: str) -> str:
+    """Reduce a VB type reference to its bare name: drop generic/array suffixes
+    (`List(Of T)`, `String()`) and namespace qualifiers (`System.Web.UI.Page`)."""
+    text = re.split(r"[(\[<]", text, maxsplit=1)[0]
+    return text.split(".")[-1].strip()
+
+
+def _extract_vb_treesitter(path: Path) -> dict:
+    """Tree-sitter walker for VB.NET that mirrors the contract every other
+    tree-sitter language follows (see ``_extract_generic``): calls are attributed
+    to the *enclosing member*, same-file callees resolve to the qualified node id,
+    and callees defined in other files are deferred to ``raw_calls`` for the
+    cross-file resolver in ``extract()``. Returns an error dict (never raises) so
+    the hybrid extractor can fall back to the regex scanner cleanly.
+
+    Two grammar realities shape this code (verified against the corpus):
+      * ``Inherits``/``Implements`` are NOT parsed as clause nodes — the grammar
+        mangles them into ``field_declaration``/``ERROR`` nodes. So inheritance is
+        recovered by a textual scan of each type block's leading lines.
+      * A call is an ``invocation`` node whose first named child is the callee
+        (``identifier`` for plain calls, ``member_access`` for ``obj.Method``);
+        there is no ``target`` field. ``New X(args)`` either parses as a
+        ``new_expression`` or (for the ``Dim x As New X(args)`` form) is split by
+        the grammar so ``X(args)`` surfaces as a bare ``invocation``."""
     try:
         try:
             import tree_sitter_tree_sitter_vb_dotnet as _vbmod
@@ -4225,6 +4271,18 @@ def _extract_vb_treesitter(path: Path) -> dict:
         nodes: list[dict] = []
         edges: list[dict] = []
         seen_ids: set[str] = set()
+        raw_calls: list[dict] = []  # unresolved calls/refs for cross-file resolution
+
+        # VB is case-insensitive, so every symbol lookup is keyed on casefold().
+        type_label_to_nid: dict[str, str] = {}    # casefold(type name) -> type nid
+        member_label_to_nid: dict[str, str] = {}  # casefold(member name) -> member nid
+        member_nids: set[str] = set()
+        type_nodes: list[tuple[str, object]] = []          # (type nid, type block node)
+        member_bodies: list[tuple[str, object, str]] = []  # (member nid, node, owner type nid)
+
+        seen_call_pairs: set[tuple[str, str]] = set()
+        seen_ref_pairs: set[tuple[str, str]] = set()
+        seen_inherit_pairs: set[tuple[str, str, str]] = set()
 
         def add_node(nid: str, label: str, line: int) -> None:
             if nid not in seen_ids:
@@ -4235,6 +4293,20 @@ def _extract_vb_treesitter(path: Path) -> dict:
                     "file_type": "code",
                     "source_file": str_path,
                     "source_location": f"L{line}",
+                })
+
+        def add_stub(nid: str, label: str) -> None:
+            # Sourceless stub for a base/import target defined elsewhere (or in a
+            # framework). _rewire_unique_stub_nodes() reconnects it to the unique
+            # real definition with the same label, if one exists corpus-wide.
+            if nid not in seen_ids:
+                seen_ids.add(nid)
+                nodes.append({
+                    "id": nid,
+                    "label": label,
+                    "file_type": "code",
+                    "source_file": "",
+                    "source_location": "",
                 })
 
         def add_edge(src: str, tgt: str, relation: str, line: int,
@@ -4254,31 +4326,42 @@ def _extract_vb_treesitter(path: Path) -> dict:
 
         add_node(file_nid, path.name, 1)
 
-        _TYPE_TYPES = frozenset({
-            "class_block", "module_block", "interface_block",
-            "structure_block", "enum_block",
-        })
-        _MEMBER_TYPES = frozenset({
-            "method_declaration", "constructor_declaration",
-            "property_declaration", "event_declaration",
-        })
-
         def decl_name(node) -> str | None:
             name_node = node.child_by_field_name("name")
             if name_node is not None:
                 return _read_text(name_node, source)
-            # Fallback: scan the node and its header child(ren) for the first
-            # identifier-like named child.
-            candidates = [node]
+            if node.type == "constructor_declaration":
+                return "New"  # VB constructors are `Sub New`
+            # Field names are reliable for VB declarations; this only covers the
+            # namespace_name case and the rare node with no "name" field.
             for child in node.named_children:
-                if child.type.endswith("statement") or child.type.endswith("header"):
-                    candidates.append(child)
-            for cand in candidates:
-                for child in cand.named_children:
-                    if "identifier" in child.type or child.type == "name":
-                        return _read_text(child, source)
+                if child.type in ("identifier", "namespace_name", "name"):
+                    return _read_text(child, source)
             return None
 
+        def invocation_callee(node) -> tuple[str | None, bool]:
+            """Return (callee name, is_member_call) for an `invocation` node."""
+            first = next((c for c in node.children if c.is_named), None)
+            if first is None:
+                return None, False
+            if first.type == "identifier":
+                return _read_text(first, source), False
+            if first.type == "member_access":
+                ids = [c for c in first.children if c.type == "identifier"]
+                if ids:
+                    return _read_text(ids[-1], source), True
+                return None, True
+            return None, False
+
+        def new_typename(node) -> str | None:
+            for c in node.children:
+                if not c.is_named or c.type == "argument_list":
+                    continue
+                name = _vb_clean_type_name(_read_text(c, source))
+                return name or None
+            return None
+
+        # ── Pass 1: structure (types, members, namespaces, imports) ───────────
         def walk(node, parent_ns: str | None, parent_type: str | None) -> None:
             ntype = node.type
             line = node.start_point[0] + 1
@@ -4294,22 +4377,31 @@ def _extract_vb_treesitter(path: Path) -> dict:
                         walk(child, ns_nid, parent_type)
                     return
 
-            elif ntype in _TYPE_TYPES:
+            elif ntype in _VB_TYPE_TYPES:
                 name = decl_name(node)
                 if name:
                     type_nid = _make_id(stem, name)
                     add_node(type_nid, name, line)
                     add_edge(container, type_nid, "contains", line)
+                    type_label_to_nid.setdefault(name.casefold(), type_nid)
+                    type_nodes.append((type_nid, node))
                     for child in node.children:
                         walk(child, parent_ns, type_nid)
                     return
 
-            elif ntype in _MEMBER_TYPES and parent_type:
+            elif ntype in _VB_MEMBER_TYPES and parent_type:
                 name = decl_name(node)
                 if name:
                     member_nid = _make_id(parent_type, name)
                     add_node(member_nid, name, line)
                     add_edge(parent_type, member_nid, "contains", line)
+                    member_nids.add(member_nid)
+                    member_bodies.append((member_nid, node, parent_type))
+                    # Constructors ("New") carry no useful call-graph signal as a
+                    # callee, so keep them out of the resolution map.
+                    if name.casefold() != "new":
+                        member_label_to_nid[name.casefold()] = member_nid
+                return  # statements are resolved in pass 2, not here
 
             elif ntype == "imports_statement":
                 raw = _read_text(node, source)
@@ -4317,37 +4409,139 @@ def _extract_vb_treesitter(path: Path) -> dict:
                 # First token is the "Imports" keyword; the rest hold the name.
                 for tok in tokens[1:]:
                     last = tok.split(".")[-1]
-                    if last and last.lower() != "imports":
+                    if last and last.casefold() != "imports":
                         tgt = _make_id(last)
+                        add_stub(tgt, last)
                         add_edge(file_nid, tgt, "imports", line, context="import")
                         break
-
-            elif ntype == "inherits_clause" and parent_type:
-                for child in node.named_children:
-                    base = _read_text(child, source).split(".")[-1].strip()
-                    if base:
-                        add_edge(parent_type, _make_id(base), "inherits", line)
-
-            elif ntype == "implements_clause" and parent_type:
-                for child in node.named_children:
-                    base = _read_text(child, source).split(".")[-1].strip()
-                    if base:
-                        add_edge(parent_type, _make_id(base), "implements", line)
-
-            elif ntype in ("invocation_expression", "invocation"):
-                target = node.child_by_field_name("target")
-                if target is not None:
-                    callee = _read_text(target, source).split(".")[-1].strip()
-                    if callee:
-                        src_nid = parent_type or parent_ns or file_nid
-                        add_edge(src_nid, _make_id(callee), "calls", line,
-                                 confidence="INFERRED")
+                return
 
             for child in node.children:
                 walk(child, parent_ns, parent_type)
 
         walk(root, None, None)
-        return {"nodes": nodes, "edges": edges}
+
+        # ── Pass 1b: inheritance (textual — see docstring) ────────────────────
+        def emit_base(src_nid: str, base: str, relation: str, line: int) -> None:
+            if not re.fullmatch(r"\w+", base):
+                return
+            tgt = type_label_to_nid.get(base.casefold())  # same-file first
+            if tgt is None:
+                tgt = _make_id(base)
+                add_stub(tgt, base)
+            if tgt == src_nid:
+                return
+            key = (src_nid, tgt, relation)
+            if key not in seen_inherit_pairs:
+                seen_inherit_pairs.add(key)
+                add_edge(src_nid, tgt, relation, line)
+
+        for type_nid, type_node in type_nodes:
+            base_line0 = type_node.start_point[0]
+            for i, raw_line in enumerate(_read_text(type_node, source).split("\n")):
+                if i == 0:
+                    continue  # the `... Class X` declaration line itself
+                s = raw_line.strip()
+                if not s:
+                    continue
+                m = re.match(r"(?i)^Inherits\s+(.+)", s)
+                if m:
+                    base = _vb_clean_type_name(m.group(1))  # single base
+                    emit_base(type_nid, base, "inherits", base_line0 + i + 1)
+                    continue
+                m = re.match(r"(?i)^Implements\s+(.+)", s)
+                if m:
+                    for part in m.group(1).split(","):
+                        emit_base(type_nid, _vb_clean_type_name(part),
+                                  "implements", base_line0 + i + 1)
+                    continue
+                if s.startswith("'") or s.startswith("<") or s[:4].lower() == "rem ":
+                    continue  # comment / attribute precede the body
+                break  # first body statement reached — Inherits/Implements are done
+
+        # ── Pass 2: calls and instantiations, attributed to the member ────────
+        def resolve_call(caller_nid: str, owner_nid: str, callee: str,
+                         is_member: bool, line: int) -> None:
+            cf = callee.casefold()
+            if cf in _VB_BUILTIN_CALL_NAMES or callee in _LANGUAGE_BUILTIN_GLOBALS:
+                return
+            # Prefer a sibling method in the caller's own type, then any same-file
+            # member, then a same-file type (an `As New X(args)` instantiation the
+            # grammar split into a bare invocation).
+            sibling = _make_id(owner_nid, callee)
+            if sibling in member_nids and sibling != caller_nid:
+                _emit_call(caller_nid, sibling, line)
+                return
+            tgt = member_label_to_nid.get(cf)
+            if tgt and tgt != caller_nid:
+                _emit_call(caller_nid, tgt, line)
+                return
+            tnid = type_label_to_nid.get(cf)
+            if tnid and tnid != caller_nid:
+                _emit_ref(caller_nid, tnid, line)
+                return
+            raw_calls.append({
+                "caller_nid": caller_nid,
+                "callee": callee,
+                "is_member_call": is_member,
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+
+        def resolve_new(caller_nid: str, typename: str, line: int) -> None:
+            cf = typename.casefold()
+            if cf in _VB_BUILTIN_CALL_NAMES or typename in _LANGUAGE_BUILTIN_GLOBALS:
+                return
+            tnid = type_label_to_nid.get(cf)
+            if tnid and tnid != caller_nid:
+                _emit_ref(caller_nid, tnid, line)
+                return
+            # Defer cross-file: the resolver emits a `references` edge only if the
+            # type name resolves to exactly one definition corpus-wide, so common
+            # framework types (DataTable, ArrayList) never pollute the graph.
+            raw_calls.append({
+                "caller_nid": caller_nid,
+                "callee": typename,
+                "is_member_call": False,
+                "relation": "references",
+                "context": "type",
+                "source_file": str_path,
+                "source_location": f"L{line}",
+            })
+
+        def _emit_call(src: str, tgt: str, line: int) -> None:
+            if (src, tgt) not in seen_call_pairs:
+                seen_call_pairs.add((src, tgt))
+                add_edge(src, tgt, "calls", line, context="call")
+
+        def _emit_ref(src: str, tgt: str, line: int) -> None:
+            if (src, tgt) not in seen_ref_pairs:
+                seen_ref_pairs.add((src, tgt))
+                add_edge(src, tgt, "references", line, context="type")
+
+        def walk_calls(node, caller_nid: str, owner_nid: str) -> None:
+            ntype = node.type
+            if ntype == "invocation":
+                callee, is_member = invocation_callee(node)
+                if callee:
+                    resolve_call(caller_nid, owner_nid, callee, is_member,
+                                 node.start_point[0] + 1)
+            elif ntype == "new_expression":
+                tn = new_typename(node)
+                if tn:
+                    resolve_new(caller_nid, tn, node.start_point[0] + 1)
+            for child in node.children:
+                # Defensive: never cross into a nested declaration (VB does not
+                # nest method/type declarations, but ERROR recovery can).
+                if child.type in _VB_MEMBER_TYPES or child.type in _VB_TYPE_TYPES:
+                    continue
+                walk_calls(child, caller_nid, owner_nid)
+
+        for member_nid, member_node, owner_nid in member_bodies:
+            for child in member_node.children:
+                walk_calls(child, member_nid, owner_nid)
+
+        return {"nodes": nodes, "edges": edges, "raw_calls": raw_calls}
     except Exception as e:  # noqa: BLE001 - must never crash the pipeline
         return {"nodes": [], "edges": [], "error": str(e)}
 
@@ -11887,11 +12081,14 @@ def extract(
             else:
                 confidence = "INFERRED"
                 confidence_score = 0.8
+            # Most raw_calls are calls; a few carry an explicit relation/context
+            # (e.g. VB `New X` instantiations deferred as references). Default to
+            # the call shape so no existing-language behavior changes.
             all_edges.append({
                 "source": caller,
                 "target": tgt,
-                "relation": "calls",
-                "context": "call",
+                "relation": rc.get("relation", "calls"),
+                "context": rc.get("context", "call"),
                 "confidence": confidence,
                 "confidence_score": confidence_score,
                 "source_file": rc.get("source_file", ""),
